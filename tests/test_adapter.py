@@ -114,6 +114,14 @@ def test_frame_rejects_non_rgb():
         Frame(np.zeros((10, 20, 4), dtype=np.uint8))  # RGBA, not RGB
 
 
+def test_frame_rejects_non_uint8():
+    # The uint8 guarantee is contractual: consumers may assume 0..255 without checking.
+    with pytest.raises(ValueError):
+        Frame(np.zeros((10, 20, 3), dtype=np.float32))
+    with pytest.raises(ValueError):
+        Frame(np.zeros((10, 20, 3), dtype=np.uint16))
+
+
 # --- Easel ABC -------------------------------------------------------------------
 def test_easel_is_abstract():
     with pytest.raises(TypeError):

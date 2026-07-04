@@ -110,7 +110,14 @@ class Stroke:
 class Frame:
     """A canvas-space observation: ``image`` is an ``HxWx3`` uint8 RGB array showing
     the canvas alone, already localized/rectified out of the raw screen capture.
-    ``timestamp`` is a monotonic seconds reading from when it was captured."""
+    ``timestamp`` is a monotonic seconds reading from when it was captured.
+
+    The ``uint8``/RGB/3-channel shape is a *guarantee* every consumer may rely on
+    (perception, the planner, the verifier, the dashboard), not merely a convention —
+    so it is validated here rather than assumed downstream. The image's *size* is not
+    checked against the canvas here (a ``Frame`` does not know the canvas dimensions);
+    that agreement is enforced where a frame meets a target, in perception.
+    """
 
     image: np.ndarray
     timestamp: float = 0.0
@@ -118,6 +125,10 @@ class Frame:
     def __post_init__(self) -> None:
         if self.image.ndim != 3 or self.image.shape[2] != 3:
             raise ValueError("Frame.image must be HxWx3 RGB")
+        if self.image.dtype != np.uint8:
+            raise ValueError(
+                f"Frame.image must be uint8 (0..255), got {self.image.dtype}"
+            )
 
     @property
     def size(self) -> Tuple[int, int]:
