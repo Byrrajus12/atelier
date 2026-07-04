@@ -134,6 +134,56 @@ def test_region_grid_indexing_holds_on_non_square_canvas():
     assert np.argwhere(grid > 1e-9).tolist() == [[0, 3]]
 
 
+# --- region_bounds / cell_box (the shared cell geometry) -------------------------
+def test_region_bounds_is_the_linspace_scheme():
+    for n, (w, h) in [(16, (600, 600)), (4, (80, 40)), (7, (100, 100))]:
+        row_edges, col_edges = P.region_bounds(n, (w, h))
+        assert np.array_equal(row_edges, np.linspace(0, h, n + 1).astype(int))
+        assert np.array_equal(col_edges, np.linspace(0, w, n + 1).astype(int))
+
+
+def test_region_grid_unchanged_by_region_bounds_refactor():
+    """Byte-for-byte guard: region_grid must produce EXACTLY what the old inline
+    linspace formula did — the region_bounds extraction must not shift any cell."""
+    rng = np.random.default_rng(7)
+    for (h, w), n in [((600, 600), 16), ((40, 80), 4), ((123, 77), 9)]:
+        perr = rng.random((h, w))
+        rows = np.linspace(0, h, n + 1).astype(int)
+        cols = np.linspace(0, w, n + 1).astype(int)
+        expected = np.empty((n, n))
+        for i in range(n):
+            for j in range(n):
+                expected[i, j] = perr[rows[i]:rows[i + 1], cols[j]:cols[j + 1]].mean()
+        assert np.array_equal(P.region_grid(perr, n), expected)
+
+
+def test_cell_box_maps_to_the_exact_region_grid_cell():
+    """cell_box(i,j) must bound precisely the pixels region_grid averaged for cell
+    (i,j) — this is what lets the planner read/paint the same region the error was
+    measured over. Checked on a non-divisible (600x600, n=16) and a non-square map."""
+    rng = np.random.default_rng(11)
+    for (h, w), n in [((600, 600), 16), ((40, 80), 4)]:
+        perr = rng.random((h, w))
+        grid = P.region_grid(perr, n)
+        for i in range(n):
+            for j in range(n):
+                x0, y0, x1, y1 = P.cell_box(i, j, n, (w, h))
+                assert perr[y0:y1, x0:x1].mean() == pytest.approx(grid[i, j], rel=1e-12)
+
+
+def test_cell_box_corners_and_bounds_validation():
+    n, size = 4, (80, 40)  # (width, height)
+    assert P.cell_box(0, 0, n, size)[:2] == (0, 0)          # top-left starts at origin
+    assert P.cell_box(n - 1, n - 1, n, size)[2:] == (80, 40)  # bottom-right hits (W, H)
+    for bad in [(-1, 0), (0, n), (n, 0)]:
+        with pytest.raises(IndexError):
+            P.cell_box(bad[0], bad[1], n, size)
+    with pytest.raises(ValueError):
+        P.region_bounds(0, size)
+    with pytest.raises(ValueError):
+        P.region_bounds(100, size)  # larger than min dimension
+
+
 # --- observe(): the bundle -------------------------------------------------------
 def _frame_target(canvas, target):
     from core.adapter import Frame

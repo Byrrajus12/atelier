@@ -16,6 +16,7 @@ normalized to roughly ``[0, 1]`` before blending so the weight means what it say
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Tuple
 
 import numpy as np
 
@@ -93,6 +94,47 @@ def pixel_error(
     return color_weight * color + (1.0 - color_weight) * edge
 
 
+# --- region geometry (the single source of truth for the N x N tiling) -----------
+def region_bounds(n: int, size: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
+    """Integer cell boundaries for an ``n x n`` tiling of a ``size = (width, height)``
+    canvas: returns ``(row_edges, col_edges)``, each length ``n + 1``.
+
+    ``row_edges = linspace(0, H, n+1).astype(int)`` (the vertical / canvas-**y**
+    boundaries) and ``col_edges = linspace(0, W, n+1).astype(int)`` (horizontal /
+    canvas-**x**). Cell ``(i, j)`` spans ``y in [row_edges[i], row_edges[i+1])`` and
+    ``x in [col_edges[j], col_edges[j+1])``.
+
+    This is the ONE place the grid geometry is defined. ``region_grid`` measures error
+    over exactly these cells, and the planner maps a cell back to pixels through here
+    (via ``cell_box``), so the two can never drift — including how the remainder is
+    absorbed when W/H is not divisible by ``n``.
+    """
+    if n < 1:
+        raise ValueError("n must be >= 1")
+    w, h = size
+    if n > min(w, h):
+        raise ValueError(f"n={n} too large for a {w}x{h} canvas")
+    row_edges = np.linspace(0, h, n + 1).astype(int)
+    col_edges = np.linspace(0, w, n + 1).astype(int)
+    return row_edges, col_edges
+
+
+def cell_box(i: int, j: int, n: int, size: Tuple[int, int]) -> Tuple[int, int, int, int]:
+    """Pixel bounding box of grid cell ``(i, j)`` as ``(x0, y0, x1, y1)``, half-open
+    (``x`` in ``[x0, x1)``, ``y`` in ``[y0, y1)``). ``i`` is the row (canvas y), ``j``
+    the column (canvas x) — the same convention as ``region_error``. Built on
+    ``region_bounds`` so it matches ``region_grid``'s cells exactly."""
+    if not (0 <= i < n and 0 <= j < n):
+        raise IndexError(f"cell ({i}, {j}) out of range for n={n}")
+    row_edges, col_edges = region_bounds(n, size)
+    return (
+        int(col_edges[j]),
+        int(row_edges[i]),
+        int(col_edges[j + 1]),
+        int(row_edges[i + 1]),
+    )
+
+
 # --- aggregation -----------------------------------------------------------------
 def global_error(pixel_err: np.ndarray) -> float:
     """One scalar: the mean per-pixel error over the whole canvas, in ``[0, 1]``."""
@@ -108,22 +150,18 @@ def region_grid(pixel_err: np.ndarray, n: int = DEFAULT_GRID_N) -> np.ndarray:
     indexes the horizontal axis (canvas **x**, left -> right). So ``[0][0]`` is the
     top-left region and ``[n-1][n-1]`` is the bottom-right.
 
-    The grid tiles the **entire** canvas: cell edges are ``np.linspace(0, H, n+1)`` /
-    ``linspace(0, W, n+1)`` boundaries, so when H/W is not divisible by ``n`` the
-    remainder is absorbed by making some cells one pixel larger — no edge pixels are
-    dropped and none are counted twice.
+    The grid tiles the **entire** canvas via ``region_bounds`` (the shared cell
+    geometry), so when H/W is not divisible by ``n`` the remainder is absorbed by
+    making some cells one pixel larger — no edge pixels are dropped or double-counted.
     """
-    if n < 1:
-        raise ValueError("n must be >= 1")
     h, w = pixel_err.shape[:2]
-    if n > min(h, w):
-        raise ValueError(f"n={n} too large for a {h}x{w} error map")
-    rows = np.linspace(0, h, n + 1).astype(int)
-    cols = np.linspace(0, w, n + 1).astype(int)
+    row_edges, col_edges = region_bounds(n, (w, h))
     grid = np.empty((n, n), dtype=np.float64)
     for i in range(n):
         for j in range(n):
-            block = pixel_err[rows[i] : rows[i + 1], cols[j] : cols[j + 1]]
+            block = pixel_err[
+                row_edges[i] : row_edges[i + 1], col_edges[j] : col_edges[j + 1]
+            ]
             grid[i, j] = float(block.mean())
     return grid
 
