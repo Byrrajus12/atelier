@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+# Put the repo root on sys.path so tests can `import core...` / `import easels...`
+# without installing the project. testpaths keeps collection fast and predictable.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
