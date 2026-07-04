@@ -1,0 +1,6 @@
+{
+  "mcpServers": {
+    "playwright": { "command": "npx", "args": ["-y", "@playwright/mcp@latest"] },
+    "github": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"] }
+  }
+}
