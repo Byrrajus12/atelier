@@ -1,0 +1,72 @@
+.error-curve {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1.25rem 1.5rem 1rem;
+}
+
+.error-curve__label {
+  font-size: 0.75rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 0.75rem;
+}
+
+.error-curve__placeholder {
+  height: 320px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+
+.error-curve__svg {
+  width: 100%;
+  height: 320px;
+  display: block;
+}
+
+.error-curve__grid {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.error-curve__threshold {
+  stroke: var(--muted);
+  stroke-width: 1;
+  stroke-dasharray: 4 4;
+}
+
+.error-curve__area {
+  fill: var(--signal-dim);
+  stroke: none;
+}
+
+.error-curve__line {
+  fill: none;
+  stroke: var(--signal);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.error-curve__dot {
+  fill: var(--signal);
+  animation: error-curve-pulse 1.8s ease-out infinite;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+@keyframes error-curve-pulse {
+  0% { transform: scale(1); opacity: 1; }
+  70% { transform: scale(1.9); opacity: 0; }
+  100% { transform: scale(1.9); opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .error-curve__dot {
+    animation: none;
+  }
+}
