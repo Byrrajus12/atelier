@@ -75,7 +75,7 @@
   }
   canvas.addEventListener('pointerdown', (e) => {
     drawing = true; last = pos(e);
-    ctx.strokeStyle = current; ctx.lineWidth = 12; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.strokeStyle = current; ctx.lineWidth = 12; ctx.lineCap = 'butt'; ctx.lineJoin = 'round';
   });
   canvas.addEventListener('pointermove', (e) => {
     if (!drawing) return;
