@@ -13,19 +13,29 @@ Serialization is explicit per event type so the wire stays small: ``region_error
 sent as a nested list, but the heatmap is sent only as a *reference* (its iteration
 index), never as pixels. NaN floats (e.g. a global error before the first capture) are
 sent as ``null`` so the payload is valid JSON.
+
+``FrameCaptured`` is the one exception to "no pixels on the wire": it carries the raw
+canvas capture so the dashboard can show the live painting. Sampling and encoding are
+both publisher policy, not core's — ``frame_cadence`` drops all but every Nth capture
+before it is ever encoded, and ``frame_max_width``/``frame_jpeg_quality`` control the
+downsample/JPEG quality trade-off. The run's *final* frame is force-published on
+``run.done`` regardless of cadence, so a run whose terminal iteration falls off-cadence
+never leaves the dashboard showing a stale, unfinished-looking canvas.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import math
 import threading
 from typing import Any, Dict, List, Optional, Set
 
+import cv2
 import websockets
 
-from core.events import Event
+from core.events import Event, FrameCaptured, RunDone
 
 
 def _num(x: Any) -> Any:
@@ -121,17 +131,35 @@ class WebsocketPublisher:
     ``close()`` after (or use it as a context manager). Implements the ``EventSink``
     ``emit`` protocol structurally — it is passed wherever an ``EventSink`` is expected."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 8765):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8765,
+        frame_cadence: int = 3,
+        frame_max_width: int = 300,
+        frame_jpeg_quality: int = 60,
+    ):
         self._host = host
         self._port = port
+        # Frame publishing policy — config knobs, not core concerns (Principle 2): core
+        # emits a FrameCaptured every iteration; the publisher decides how much of that
+        # actually goes out over the wire.
+        self._frame_cadence = frame_cadence
+        self._frame_max_width = frame_max_width
+        self._frame_jpeg_quality = frame_jpeg_quality
         self._clients: Set[Any] = set()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._server = None
         self._thread: Optional[threading.Thread] = None
         self._ready = threading.Event()
-        # Bootstrap snapshot for late-joining clients: the run's start and latest state.
+        # Bootstrap snapshot for late-joining clients: the run's start, latest state, and
+        # the latest published frame.
         self._last_run_start: Optional[str] = None
         self._last_state: Optional[str] = None
+        self._last_frame: Optional[str] = None
+        # Most recent FrameCaptured seen, kept raw so run.done can force-publish it even
+        # if its iteration was off-cadence (the finished canvas must never be dropped).
+        self._last_frame_event: Optional[FrameCaptured] = None
 
     @property
     def port(self) -> int:
@@ -163,7 +191,7 @@ class WebsocketPublisher:
         # bootstrap it is already in the broadcast set, so no live event can slip past it.
         self._clients.add(websocket)
         try:
-            for snap in (self._last_run_start, self._last_state):
+            for snap in (self._last_run_start, self._last_state, self._last_frame):
                 if snap is not None:
                     await websocket.send(snap)
             await websocket.wait_closed()
@@ -201,6 +229,18 @@ class WebsocketPublisher:
     def emit(self, event: Event) -> None:
         """Serialize and schedule a non-blocking broadcast. Never blocks the paint loop;
         never raises out to it (a transport error just drops the message)."""
+        if isinstance(event, FrameCaptured):
+            self._last_frame_event = event
+            if event.iteration % self._frame_cadence == 0:
+                self._publish_frame(event)
+            return
+        if isinstance(event, RunDone):
+            # The run just ended: force out the last capture even if its iteration was
+            # off-cadence and got skipped, so the dashboard never ends on a stale,
+            # unfinished-looking canvas.
+            last = self._last_frame_event
+            if last is not None and last.iteration % self._frame_cadence != 0:
+                self._publish_frame(last)
         try:
             data = json.dumps(event_to_message(event))
         except Exception:
@@ -216,6 +256,50 @@ class WebsocketPublisher:
         loop = self._loop
         if loop is None:
             return  # not started (or already closed): drop, best-effort
+        try:
+            asyncio.run_coroutine_threadsafe(self._broadcast(data), loop)
+        except Exception:
+            pass
+
+    def _encode_frame(self, event: FrameCaptured) -> Dict[str, Any]:
+        """Downsample + JPEG + base64 a captured frame. Encoding lives here, not in
+        ``event_to_message``, because it needs this instance's config knobs
+        (``_frame_max_width``/``_frame_jpeg_quality``) — core hands over a bare ndarray
+        and never sees the encoding (Principle 2)."""
+        frame = event.frame
+        h, w = frame.shape[:2]
+        if w > self._frame_max_width:
+            scale = self._frame_max_width / w
+            frame = cv2.resize(
+                frame, (self._frame_max_width, max(1, round(h * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        ok, buf = cv2.imencode(
+            ".jpg", frame[:, :, ::-1],  # RGB -> BGR for OpenCV
+            [cv2.IMWRITE_JPEG_QUALITY, self._frame_jpeg_quality],
+        )
+        if not ok:
+            raise RuntimeError("jpeg encode failed")
+        h2, w2 = frame.shape[:2]
+        return {
+            "type": "frame.captured",
+            "iteration": event.iteration,
+            "width": w2,
+            "height": h2,
+            "image": "data:image/jpeg;base64," + base64.b64encode(buf).decode("ascii"),
+        }
+
+    def _publish_frame(self, event: FrameCaptured) -> None:
+        """Encode and broadcast one frame, best-effort — an encode failure or closed
+        transport just drops it, same contract as ``emit``."""
+        try:
+            data = json.dumps(self._encode_frame(event))
+        except Exception:
+            return
+        self._last_frame = data
+        loop = self._loop
+        if loop is None:
+            return
         try:
             asyncio.run_coroutine_threadsafe(self._broadcast(data), loop)
         except Exception:

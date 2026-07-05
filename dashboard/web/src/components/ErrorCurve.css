@@ -3,6 +3,8 @@
   border: 1px solid var(--border);
   border-radius: 4px;
   padding: 1.25rem 1.5rem 1rem;
+  flex: 2 1 560px;
+  min-width: 0;
 }
 
 .error-curve__label {

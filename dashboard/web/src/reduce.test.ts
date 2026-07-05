@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { initialState, reduce, type State } from "./reduce";
 import type {
+  FrameCapturedMsg,
   PlanDoneMsg,
   RunDoneMsg,
   RunStartMsg,
@@ -68,6 +69,17 @@ function verifyDone(overrides: Partial<VerifyDoneMsg> = {}): VerifyDoneMsg {
   };
 }
 
+function frameCaptured(overrides: Partial<FrameCapturedMsg> = {}): FrameCapturedMsg {
+  return {
+    type: "frame.captured",
+    iteration: 3,
+    width: 300,
+    height: 300,
+    image: "data:image/jpeg;base64,AAAA",
+    ...overrides,
+  };
+}
+
 function runDone(overrides: Partial<RunDoneMsg> = {}): RunDoneMsg {
   return {
     type: "run.done",
@@ -86,6 +98,7 @@ describe("reduce", () => {
     expect(initialState.errorSeries).toEqual([]);
     expect(initialState.strokeLog).toEqual([]);
     expect(initialState.terminal).toBeNull();
+    expect(initialState.frame).toBeNull();
   });
 
   it("captures run.start config", () => {
@@ -156,6 +169,15 @@ describe("reduce", () => {
     expect(s.strokeLog[1].cell).toEqual([2, 2]);
   });
 
+  it("stores the latest frame.captured, replacing the previous one", () => {
+    let s: State = initialState;
+    s = reduce(s, frameCaptured({ iteration: 3, image: "data:image/jpeg;base64,AAA" }));
+    expect(s.frame).toEqual({ iteration: 3, width: 300, height: 300, image: "data:image/jpeg;base64,AAA" });
+
+    s = reduce(s, frameCaptured({ iteration: 6, image: "data:image/jpeg;base64,BBB" }));
+    expect(s.frame).toEqual({ iteration: 6, width: 300, height: 300, image: "data:image/jpeg;base64,BBB" });
+  });
+
   it("records run.done as the terminal state", () => {
     const s = reduce(initialState, runDone({ reason: "budget", converged: false }));
     expect(s.terminal).toEqual(runDone({ reason: "budget", converged: false }));
@@ -174,10 +196,12 @@ describe("reduce", () => {
     s = reduce(s, stateUpdate({ iteration: 0, global_error: 0.17 }));
     s = reduce(s, planDone({ iteration: 1 }));
     s = reduce(s, verifyDone({ iteration: 1 }));
+    s = reduce(s, frameCaptured({ iteration: 1 }));
     s = reduce(s, runDone({ reason: "converged" }));
     expect(s.errorSeries).toHaveLength(1);
     expect(s.strokeLog).toHaveLength(1);
     expect(s.terminal).not.toBeNull();
+    expect(s.frame).not.toBeNull();
 
     // A second run begins on the same connection (e.g. the dashboard stayed
     // open across a restart of scripts/live_run.py).
@@ -188,6 +212,7 @@ describe("reduce", () => {
     expect(s.strokeLog).toEqual([]);
     expect(s.terminal).toBeNull();
     expect(s.current).toBeNull();
+    expect(s.frame).toBeNull();
   });
 
   it("updates connection status via the local connection action without touching data", () => {

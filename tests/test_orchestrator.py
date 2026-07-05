@@ -148,8 +148,8 @@ def test_event_sequence_is_complete_and_ordered():
     strokes = sum(isinstance(e, ExecuteDone) for e in sink.events)
     assert strokes >= 2
     expected = (
-        ["run.start", "observe.done", "state.update"]
-        + strokes * ["plan.done", "execute.done", "observe.done", "verify.done", "state.update"]
+        ["run.start", "observe.done", "frame.captured", "state.update"]
+        + strokes * ["plan.done", "execute.done", "observe.done", "frame.captured", "verify.done", "state.update"]
         + ["state.update", "run.done"]
     )
     assert types(sink) == expected

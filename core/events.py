@@ -86,6 +86,19 @@ class ObserveDone(Event):
 
 
 @dataclass(frozen=True)
+class FrameCaptured(Event):
+    """The raw canvas capture for this iteration, offered as its own event so frame
+    cadence/publishing policy (e.g. periodic sampling for a wire transport) can vary
+    independently of error-state consumers (Principle 5: a sink decides sampling, the
+    core doesn't). ``frame`` is the captured RGB image (HxWx3 uint8); ``iteration`` uses
+    the same numbering as ``ObserveDone`` (0 is the pre-stroke baseline)."""
+
+    type: ClassVar[str] = "frame.captured"
+    iteration: int
+    frame: np.ndarray
+
+
+@dataclass(frozen=True)
 class PlanDone(Event):
     """The planner's decision for this iteration: the region-level ``PaintIntent`` it
     chose (which cell, what color, the error that drove it)."""

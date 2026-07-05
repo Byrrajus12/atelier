@@ -63,6 +63,16 @@ export interface VerifyDoneMsg {
   verdict: Verdict;
 }
 
+// Sent only periodically (publisher-side cadence), plus always the run's final frame —
+// see dashboard/publisher.py's frame_cadence knob and force-publish-on-run.done rule.
+export interface FrameCapturedMsg {
+  type: "frame.captured";
+  iteration: number;
+  width: number;
+  height: number;
+  image: string; // data:image/jpeg;base64,...
+}
+
 export const STATUS_RUNNING = "running";
 export const STATUS_DONE = "done";
 
@@ -94,6 +104,7 @@ export type WireMessage =
   | PlanDoneMsg
   | ExecuteDoneMsg
   | VerifyDoneMsg
+  | FrameCapturedMsg
   | StateUpdateMsg
   | RunDoneMsg;
 

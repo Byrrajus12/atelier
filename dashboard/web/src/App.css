@@ -6,3 +6,10 @@
   flex-direction: column;
   gap: 1.25rem;
 }
+
+.app__instruments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.25rem;
+  align-items: stretch;
+}

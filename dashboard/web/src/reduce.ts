@@ -29,6 +29,13 @@ export interface CurrentState {
   converged: boolean;
 }
 
+export interface FrameState {
+  iteration: number;
+  width: number;
+  height: number;
+  image: string;
+}
+
 export interface State {
   connection: ConnectionStatus;
   config: RunStartMsg | null;
@@ -36,6 +43,7 @@ export interface State {
   strokeLog: StrokeRow[];
   current: CurrentState | null;
   terminal: RunDoneMsg | null;
+  frame: FrameState | null;
 }
 
 export const initialState: State = {
@@ -45,6 +53,7 @@ export const initialState: State = {
   strokeLog: [],
   current: null,
   terminal: null,
+  frame: null,
 };
 
 function upsertErrorPoint(series: ErrorPoint[], point: ErrorPoint): ErrorPoint[] {
@@ -104,6 +113,17 @@ export function reduce(state: State, action: ReducerAction): State {
 
     case "execute.done":
       return state; // stroke_count isn't surfaced in this dashboard's components
+
+    case "frame.captured":
+      return {
+        ...state,
+        frame: {
+          iteration: action.iteration,
+          width: action.width,
+          height: action.height,
+          image: action.image,
+        },
+      };
 
     case "verify.done":
       return {

@@ -16,6 +16,7 @@ from core.events import (
     Event,
     EventSink,
     ExecuteDone,
+    FrameCaptured,
     ObserveDone,
     PlanDone,
     RecordingSink,
@@ -78,6 +79,13 @@ def test_observe_done_carries_arrays():
     ev = ObserveDone(iteration=2, global_error=0.3, region_error=grid, heatmap=heat)
     assert ev.iteration == 2 and ev.global_error == 0.3
     assert ev.region_error is grid and ev.heatmap is heat
+
+
+def test_frame_captured_carries_raw_array():
+    frame = np.zeros((16, 16, 3), dtype=np.uint8)
+    ev = FrameCaptured(iteration=3, frame=frame)
+    assert ev.type == "frame.captured"
+    assert ev.iteration == 3 and ev.frame is frame
 
 
 def test_plan_and_verify_carry_domain_objects():

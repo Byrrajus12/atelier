@@ -38,6 +38,27 @@ function colorFor(cell) {
   return COLORS[`${cell[0]},${cell[1]}`] ?? [128, 128, 128];
 }
 
+// Two precomputed 120x120 JPEGs (blank + fully-painted, matching the ITERATIONS
+// cells/colors above) so the mock feed can exercise CanvasView without a real
+// orchestrator/canvas. Mirrors what dashboard/publisher.py sends: a data URL, sampled
+// periodically (here every FRAME_CADENCE iterations), with the final frame always sent
+// regardless of cadence.
+const FRAME_CADENCE = 3;
+const BLANK_FRAME =
+  "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAoHBwgHBgoICAgLCgoLDhgQDg0NDh0VFhEYIx8lJCIfIiEmKzcvJik0KSEiMEExNDk7Pj4+JS5ESUM8SDc9Pjv/2wBDAQoLCw4NDhwQEBw7KCIoOzs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozv/wAARCAB4AHgDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD2aiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigD//2Q==";
+const PAINTED_FRAME =
+  "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAoHBwgHBgoICAgLCgoLDhgQDg0NDh0VFhEYIx8lJCIfIiEmKzcvJik0KSEiMEExNDk7Pj4+JS5ESUM8SDc9Pjv/2wBDAQoLCw4NDhwQEBw7KCIoOzs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozv/wAARCAB4AHgDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD2aiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAOb8XeLv+EV+yf6D9q+07/wDlrs27dv8AsnP3v0rm/wDhbv8A1A//ACb/APsKPi7/AMwj/tt/7JXm9eZiMRUhUcYvQ+5ynKcFiMFCrVheTv1fdroz0j/hbv8A1A//ACb/APsK9Ir5vr6QrbCVZ1L8zPMz/AYfCez9hG1731b2t3YUUUV2nzIUUUUAeSf8L1/6lv8A8nv/ALXR/wAL1/6lv/ye/wDtdeS0V+mf2Dl3/Pv8Zf5nF7Wfc+h/Anjv/hNft3/Et+xfY/L/AOW/mb927/ZGMbf1rrq8k+BX/Md/7d//AGpXrdfDZtQp4fGzpUlaKt+SfU6qbbimwooorzCwooooA83+Lv8AzCP+23/sleb19IUVxVcJ7Sblc+mwGf8A1TDxoezva+t7btvsfN9fSFFFaUKHsr63ucWa5r/aHJ7nLy3633t5LsFFFFdJ4wUUUUAfJVFfWtFfZ/61f9Of/Jv/ALU5/YeZ5J8Cv+Y7/wBu/wD7Ur1uiivmcfivreIlXta9tN9kkbRjyqwUUUVxFBRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAeP8Ax7/5gP8A28f+0q8gr1/49/8AMB/7eP8A2lXkFABX1/XyBX1/QAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQBx/j7wD/wAJx9g/4mf2H7H5n/LDzN+/b/tDGNv61x//AAoT/qZv/JH/AO2V7BRQB4//AMKE/wCpm/8AJH/7ZXsFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQB//Z";
+
+function frameCapturedMsg(iteration, painted) {
+  return {
+    type: "frame.captured",
+    iteration,
+    width: 120,
+    height: 120,
+    image: `data:image/jpeg;base64,${painted ? PAINTED_FRAME : BLANK_FRAME}`,
+  };
+}
+
 function cellBox(cell) {
   const size = 600 / GRID_N;
   const [i, j] = cell;
@@ -102,14 +123,16 @@ const wss = new WebSocketServer({ port: PORT });
 const clients = new Set();
 let lastRunStart = null;
 let lastState = null;
+let lastFrame = null;
 
 wss.on("connection", (ws) => {
   clients.add(ws);
   console.log(`[mock-feed] client connected (${clients.size} total)`);
-  // Mirror publisher.py's bootstrap: replay the last run.start + state.update
+  // Mirror publisher.py's bootstrap: replay the last run.start + state.update + frame
   // to a late joiner so it renders mid-run without waiting for the next tick.
   if (lastRunStart) ws.send(lastRunStart);
   if (lastState) ws.send(lastState);
+  if (lastFrame) ws.send(lastFrame);
   ws.on("close", () => {
     clients.delete(ws);
     console.log(`[mock-feed] client disconnected (${clients.size} total)`);
@@ -120,6 +143,7 @@ function broadcast(msg) {
   const data = JSON.stringify(msg);
   if (msg.type === "run.start") lastRunStart = data;
   if (msg.type === "state.update") lastState = data;
+  if (msg.type === "frame.captured") lastFrame = data;
   for (const ws of clients) {
     if (ws.readyState === ws.OPEN) ws.send(data);
   }
@@ -133,6 +157,7 @@ async function runOnce() {
   await sleep(STEP_MS);
 
   broadcast(stateUpdateMsg(0, 0.1717, "running", false));
+  broadcast(frameCapturedMsg(0, false));
   await sleep(STEP_MS);
 
   let before = 0.1717;
@@ -150,12 +175,23 @@ async function runOnce() {
     await sleep(STEP_MS);
 
     broadcast(stateUpdateMsg(iteration, after, "running", false));
+    // Mirrors the publisher's cadence sampling: only every FRAME_CADENCEth
+    // iteration gets a frame, and the (canned) canvas is "painted" from
+    // iteration 3 on, once the three distinct cells have all landed once.
+    if (iteration % FRAME_CADENCE === 0) {
+      broadcast(frameCapturedMsg(iteration, iteration >= 3));
+    }
     await sleep(STEP_MS);
 
     before = after;
   }
 
   const finalIteration = ITERATIONS.length;
+  // Mirrors the publisher's force-publish-on-run.done rule: the finished canvas is
+  // always sent, even if the terminal iteration falls off-cadence.
+  if (finalIteration % FRAME_CADENCE !== 0) {
+    broadcast(frameCapturedMsg(finalIteration, true));
+  }
   const finalError = ITERATIONS[ITERATIONS.length - 1].global;
   broadcast(stateUpdateMsg(finalIteration, finalError, "done", true));
   broadcast(runDoneMsg(finalIteration, finalError));

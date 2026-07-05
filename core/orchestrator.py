@@ -66,6 +66,7 @@ from core.events import (
     STATUS_RUNNING,
     EventSink,
     ExecuteDone,
+    FrameCaptured,
     ObserveDone,
     PlanDone,
     RunDone,
@@ -295,6 +296,7 @@ class Orchestrator:
             region_error=obs.region_error,
             heatmap=obs.heatmap,
         ))
+        self._emit(FrameCaptured(iteration=iteration, frame=obs.frame.image))
         return obs
 
     def _capture(self):

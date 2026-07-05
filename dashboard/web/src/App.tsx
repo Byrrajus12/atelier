@@ -1,3 +1,4 @@
+import { CanvasView } from "./components/CanvasView";
 import { ErrorCurve } from "./components/ErrorCurve";
 import { RunHeader } from "./components/RunHeader";
 import { StrokeLog } from "./components/StrokeLog";
@@ -17,7 +18,10 @@ function App() {
         current={state.current}
         terminal={state.terminal}
       />
-      <ErrorCurve series={state.errorSeries} errorThreshold={state.config?.error_threshold ?? null} />
+      <div className="app__instruments">
+        <ErrorCurve series={state.errorSeries} errorThreshold={state.config?.error_threshold ?? null} />
+        <CanvasView frame={state.frame} canvasSize={state.config?.canvas_size ?? null} />
+      </div>
       <StrokeLog rows={state.strokeLog} />
     </div>
   );
