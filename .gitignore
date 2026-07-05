@@ -5,6 +5,8 @@ node_modules/
 *.local
 easels/private/
 dashboard/.next/
+PRODUCT.md
+DESIGN.md
 
 # Throwaway M1 spike artifacts (code + FINDINGS.md stay tracked)
 spike/_spike_profile/
