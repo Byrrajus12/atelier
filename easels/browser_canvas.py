@@ -73,7 +73,18 @@ PALETTE: Tuple[Color, ...] = ((255, 0, 0), (0, 0, 255), (17, 17, 17))  # red/blu
 # *outside* its corner -> a negative inset (the dst quad expands beyond the canvas).
 FIDUCIAL_INSET = -15.0
 CANVAS_SIZE = (600, 600)    # canvas-space frame, matches the page's CSS canvas
-_SWATCH_MASK_PAD = 12       # extra px around the canvas footprint when hiding it
+
+# The palette swatch column lives just to the RIGHT of the canvas at a fixed layout
+# offset (canvas_page/index.html: a 24px wrap gap past the 33px frame padding, then a
+# 44px-wide column of three 44px swatches, gap 10px). We search for a swatch ONLY within
+# this strip — mapped to the screen through the canvas homography — instead of over the
+# whole screen. That removes an entire class of "something off-canvas looks like a
+# swatch" bugs: dark window chrome, a dark-themed editor, or the taskbar are all large
+# near-black regions that otherwise beat the tiny (44px) near-black swatch and steal the
+# click. Coordinates are CANVAS pixels (CSS-px offsets from the canvas top-left, which
+# the canvas homography maps to the screen); the box wraps the three swatches (canvas
+# x 657..701, y -33..119) with ~14px of margin.
+PALETTE_REGION_CANVAS = (643.0, -47.0, 715.0, 133.0)  # (x0, y0, x1, y1) in canvas px
 
 # Timing that reliably registers input in the browser (from FINDINGS).
 _MOVE_DT = 0.03
@@ -181,30 +192,43 @@ class BrowserCanvasEasel(Easel):
         raw = np.array(self._sct.grab(mon))     # BGRA
         return raw[:, :, [2, 1, 0]].copy()      # -> RGB
 
+    def _palette_region(self, h_c2s, screen_shape):
+        """Screen-pixel bounding box of the palette strip, from ``PALETTE_REGION_CANVAS``
+        mapped through the canvas->screen homography and clipped to the capture. Returns
+        ``(x0, y0, x1, y1)`` or ``None`` if it falls entirely off-screen."""
+        from easels import _geometry as G
+
+        x0c, y0c, x1c, y1c = PALETTE_REGION_CANVAS
+        pts = [
+            G.apply_homography(c, h_c2s)
+            for c in ((x0c, y0c), (x1c, y0c), (x0c, y1c), (x1c, y1c))
+        ]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        h, w = screen_shape[:2]
+        x0 = max(0, int(min(xs)))
+        y0 = max(0, int(min(ys)))
+        x1 = min(w, int(max(xs)) + 1)
+        y1 = min(h, int(max(ys)) + 1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return x0, y0, x1, y1
+
     def _locate_swatch(self, screen, h_c2s, swatch: Color):
         from easels import _geometry as G
 
-        # Hide the *true* canvas footprint (its four corners mapped to screen via the
-        # homography), not the fiducial-centroid box — the fiducials sit outside the
-        # canvas, and even a positive inset would leave a ring of paintable canvas
-        # unmasked. Pad outward so no painted pixel near the edge can masquerade as a
-        # swatch.
-        w, h = self._canvas_size
-        corners_screen = [
-            G.apply_homography((cx, cy), h_c2s)
-            for cx, cy in ((0, 0), (w, 0), (0, h), (w, h))
-        ]
-        xs = [p[0] for p in corners_screen]
-        ys = [p[1] for p in corners_screen]
-        pad = _SWATCH_MASK_PAD
-        x0 = max(0, int(min(xs)) - pad)
-        y0 = max(0, int(min(ys)) - pad)
-        x1 = int(max(xs)) + pad
-        y1 = int(max(ys)) + pad
-        masked = screen.copy()
-        masked[y0:y1, x0:x1] = 0
-        hit = G.find_color_centroid(masked, swatch)
-        return None if hit is None else (hit[0], hit[1])
+        # Search ONLY the palette strip (right of the canvas), not the whole screen, so
+        # no off-canvas near-color region can be mistaken for a swatch. This is robust for
+        # ALL swatches, and especially the near-black one, whose color is common off-canvas
+        # (dark chrome/editor/taskbar) and previously lost the largest-blob contest.
+        region = self._palette_region(h_c2s, screen.shape)
+        if region is None:
+            return None
+        rx0, ry0, rx1, ry1 = region
+        hit = G.find_color_centroid(screen[ry0:ry1, rx0:rx1], swatch)
+        if hit is None:
+            return None
+        return (hit[0] + rx0, hit[1] + ry0)  # crop-local -> screen coords
 
     def _click(self, x: int, y: int) -> None:
         pydirectinput.moveTo(x, y)

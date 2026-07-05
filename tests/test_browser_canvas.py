@@ -12,7 +12,10 @@ from easels import browser_canvas as BC
 
 FIDUCIALS = BC.FIDUCIAL_COLORS
 CENTROIDS = {"tl": (100, 50), "tr": (500, 50), "bl": (100, 450), "br": (500, 450)}
-RED_SWATCH_XY = (560, 90)
+# The swatch must sit where the REAL palette strip maps to for this homography (just
+# right of the canvas), since swatch search is now restricted to that strip. This is the
+# red swatch's canvas-space center (~679, -11) mapped through the CENTROIDS homography.
+RED_SWATCH_XY = (541, 53)
 
 
 def make_screen(paint_canvas_red=False):
@@ -109,6 +112,32 @@ def test_apply_stroke_ignores_painted_pixels_when_locating_swatch():
     e.apply_stroke(Stroke(path=(Point(300, 300),), brush=BrushSpec(color=(255, 0, 0))))
     assert clicks[0][0] == pytest.approx(RED_SWATCH_XY[0], abs=2)
     assert clicks[0][1] == pytest.approx(RED_SWATCH_XY[1], abs=2)
+
+
+def test_locate_swatch_restricted_to_palette_strip_ignores_dark_distractor():
+    """The near-black swatch failure mode: a large near-black region OUTSIDE the palette
+    strip (a dark editor, window chrome, the taskbar) used to win the largest-blob
+    contest and steal the click. Restricting the search to the palette strip (derived
+    from the canvas location) must ignore it and find the small black swatch."""
+    e = make_easel()
+    # Grey page background (NOT near-black), fiducials, a small black swatch in the strip.
+    screen = np.full((520, 640, 3), 128, dtype=np.uint8)
+    half = 8
+    for name, (cx, cy) in CENTROIDS.items():
+        screen[cy - half:cy + half + 1, cx - half:cx + half + 1] = FIDUCIALS[name]
+    black_xy = (541, 120)  # in the palette strip (black is the third swatch, lower down)
+    bx, by = black_xy
+    screen[by - 12:by + 13, bx - 12:bx + 13] = (17, 17, 17)
+    # A big near-black distractor far outside the palette strip (e.g. a dark editor),
+    # clear of the corner fiducials.
+    screen[240:360, 150:400] = (10, 10, 10)
+
+    corners = G.find_fiducials(screen, FIDUCIALS)
+    _, h_c2s = G.canvas_homographies(corners, (600, 600), BC.FIDUCIAL_INSET)
+    loc = e._locate_swatch(screen, h_c2s, (17, 17, 17))
+    assert loc is not None
+    assert loc[0] == pytest.approx(bx, abs=3)  # the swatch, not the distractor (~x=160)
+    assert loc[1] == pytest.approx(by, abs=3)
 
 
 def test_apply_stroke_raises_when_swatch_missing():
