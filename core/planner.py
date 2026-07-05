@@ -25,7 +25,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from core.adapter import Color
-from core.perception import Observation, cell_box
+from core.perception import Observation, cell_box, color_error, DELTA_E_REF
 
 DEFAULT_ERROR_THRESHOLD = 0.02  # provisional; region error is mean-per-pixel in [0,1]
 
@@ -84,22 +84,83 @@ class Planner(ABC):
 class GreedyPlanner(Planner):
     """Model-free baseline: each call, pick the single highest-error region and fill it
     toward the target's mean color there. Returns ``None`` once no region's error
-    exceeds ``error_threshold``."""
+    exceeds ``error_threshold``.
 
-    def __init__(self, error_threshold: float = DEFAULT_ERROR_THRESHOLD):
+    ``palette`` opts in a no-undo safety guard (Principle 7). When the available swatches
+    are supplied, the planner skips any region that no swatch can improve — the target
+    there is closer to what is already on the canvas than to any reachable color, so
+    painting it would only make the canvas worse and cannot be undone. The classic
+    failure this prevents: a region whose target is the (unpaintable) white background;
+    without white in the palette, blindly filling it with the nearest swatch raises the
+    error irreversibly.
+
+    Limits of the guard, stated honestly: it compares only the perceptual **color** term
+    of the error metric (a uniform swatch fill has no interior edges, and the metric's
+    structural term can't be predicted per-cell without border artifacts). So it removes
+    self-damage from color-unpaintable cells like the white gap — completely — but it does
+    NOT guarantee the verifier never rejects an edge-dominated region. It is a color-space
+    safeguard, not a promise of no rejections.
+
+    With ``palette=None`` (the default) the guard is off and behavior is the plain argmax
+    baseline, unchanged."""
+
+    def __init__(
+        self,
+        error_threshold: float = DEFAULT_ERROR_THRESHOLD,
+        palette: Optional[Tuple[Color, ...]] = None,
+    ):
         if error_threshold < 0:
             raise ValueError("error_threshold must be >= 0")
+        if palette is not None and len(palette) == 0:
+            raise ValueError("palette, if given, must be non-empty")
         self.error_threshold = error_threshold
+        self.palette = tuple(palette) if palette is not None else None
 
     def plan(self, observation: Observation) -> Optional[PaintIntent]:
         grid = observation.region_error
         n = grid.shape[0]
-        # argmax over the flattened grid: deterministic, first-in-row-major tie-break.
-        i, j = np.unravel_index(int(np.argmax(grid)), grid.shape)
-        i, j = int(i), int(j)
-        error = float(grid[i, j])
-        if error <= self.error_threshold:
-            return None  # converged: nothing worth painting
-        box = cell_box(i, j, n, observation.frame.size)
-        color = region_mean_color(observation.target.image, box)
-        return PaintIntent(cell=(i, j), box=box, color=color, error=error)
+        # Walk regions from most to least wrong. With no palette this returns the argmax
+        # region (legacy behavior, first-in-row-major tie-break); with a palette it skips
+        # regions no swatch can improve and takes the worst improvable one instead.
+        # Descending error, stable so an exact tie still breaks first-in-row-major (the
+        # orchestrator relies on that determinism). Negate + stable sort, not a reversed
+        # ascending sort, which would flip ties to last-in-row-major.
+        order = np.argsort(-grid, axis=None, kind="stable")
+        for flat in order:
+            i, j = np.unravel_index(int(flat), grid.shape)
+            i, j = int(i), int(j)
+            error = float(grid[i, j])
+            if error <= self.error_threshold:
+                return None  # this and every remaining region is below threshold
+            box = cell_box(i, j, n, observation.frame.size)
+            color = region_mean_color(observation.target.image, box)
+            if self.palette is not None and not self._swatch_improves(observation, box):
+                continue  # no reachable color helps here; painting would self-damage
+            return PaintIntent(cell=(i, j), box=box, color=color, error=error)
+        return None  # nothing above threshold is worth (or safe) painting
+
+    def _swatch_improves(self, observation: Observation, box: Tuple[int, int, int, int]) -> bool:
+        """True if the swatch the easel would actually pick brings this region closer, in
+        perceptual color, than the canvas already is. Mirrors the easel's Euclidean-RGB
+        nearest-swatch selection so the predicted color is the one that would really land,
+        then compares mean CIEDE2000-to-target for the current canvas vs a uniform swatch
+        fill (same normalization as the error metric)."""
+        x0, y0, x1, y1 = box
+        target_patch = observation.target.image[y0:y1, x0:x1]
+        canvas_patch = observation.frame.image[y0:y1, x0:x1]
+        requested = region_mean_color(observation.target.image, box)
+        swatch = self._nearest_swatch(requested)
+        fill = np.full(target_patch.shape, swatch, dtype=np.uint8)
+        current = float(color_error(canvas_patch, target_patch).mean()) / DELTA_E_REF
+        predicted = float(color_error(fill, target_patch).mean()) / DELTA_E_REF
+        return predicted < current
+
+    def _nearest_swatch(self, requested: Color) -> Color:
+        """Nearest palette color to ``requested`` in Euclidean RGB — the same rule the
+        easel uses to realize a requested color, so the guard predicts the color that
+        would truly be painted."""
+        r = np.array(requested, dtype=float)
+        return min(
+            self.palette,  # type: ignore[arg-type]  # guarded by caller (palette set)
+            key=lambda c: float(np.sum((np.array(c, dtype=float) - r) ** 2)),
+        )

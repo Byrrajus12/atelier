@@ -153,3 +153,86 @@ def test_identical_canvas_and_target_converges_immediately():
     img = solid(64, 64, (30, 60, 90))
     obs = observe(Frame(img.copy()), Target(img.copy()), n=8)
     assert GreedyPlanner().plan(obs) is None
+
+
+# --- no-undo palette guard (M7.6) ------------------------------------------------
+# A palette without white, matching the reference easel's red/blue/near-black.
+PALETTE = ((255, 0, 0), (0, 0, 255), (17, 17, 17))
+
+
+def test_guard_skips_unpaintable_cell_and_picks_a_lower_improvable_one():
+    """The hottest region's target is the white background — no swatch improves it, so a
+    guarded planner must skip it and paint the lower-error region a swatch CAN improve,
+    rather than blindly self-damaging the white gap (the iter-13 live-run failure)."""
+    n = 2
+    canvas = solid(40, 40, (255, 255, 255))          # blank white canvas
+    target = solid(40, 40, (255, 255, 255))
+    target[0:20, 20:40] = (0, 0, 255)                # cell (0,1): blue, paintable
+    grid = np.zeros((n, n))
+    grid[0, 0] = 0.9                                 # white gap: hottest but unpaintable
+    grid[0, 1] = 0.5                                 # blue: cooler but improvable
+    obs = make_observation(canvas, target, grid)
+
+    intent = GreedyPlanner(palette=PALETTE).plan(obs)
+    assert intent is not None
+    assert intent.cell == (0, 1)                     # skipped the white gap, took the blue
+
+
+def test_guard_off_by_default_still_picks_the_white_gap():
+    """palette=None keeps the plain argmax baseline: the same white-gap region is picked
+    (the pre-M7.6 behavior), proving the guard is strictly opt-in."""
+    n = 2
+    canvas = solid(40, 40, (255, 255, 255))
+    target = solid(40, 40, (255, 255, 255))
+    target[0:20, 20:40] = (0, 0, 255)
+    grid = np.zeros((n, n))
+    grid[0, 0] = 0.9
+    grid[0, 1] = 0.5
+    obs = make_observation(canvas, target, grid)
+
+    intent = GreedyPlanner().plan(obs)               # no palette -> blind
+    assert intent.cell == (0, 0)                     # picks the unpaintable hottest cell
+
+
+def test_guard_returns_none_when_no_above_threshold_cell_is_improvable():
+    """If every region above threshold is color-unpaintable, the guarded planner reports
+    convergence (None) rather than making the canvas worse irreversibly."""
+    n = 2
+    canvas = solid(40, 40, (255, 255, 255))
+    target = solid(40, 40, (255, 255, 255))          # all-white target, all-white canvas
+    grid = np.zeros((n, n))
+    grid[0, 0] = 0.9                                 # a hot region, but nothing helps it
+    obs = make_observation(canvas, target, grid)
+
+    assert GreedyPlanner(palette=PALETTE).plan(obs) is None
+
+
+def test_guard_does_not_over_skip_an_improvable_cell():
+    """A region a swatch clearly improves is still selected — the guard only skips the
+    genuinely-unpaintable, it does not suppress normal work."""
+    n = 2
+    canvas = solid(40, 40, (255, 255, 255))
+    target = solid(40, 40, (255, 255, 255))
+    target[0:20, 0:20] = (255, 0, 0)                 # cell (0,0): red, paintable
+    grid = np.zeros((n, n))
+    grid[0, 0] = 0.7
+    obs = make_observation(canvas, target, grid)
+
+    intent = GreedyPlanner(palette=PALETTE).plan(obs)
+    assert intent is not None
+    assert intent.cell == (0, 0)
+    assert intent.color == (255, 0, 0)               # requests the ideal target color
+
+
+def test_guard_rejects_empty_palette():
+    with pytest.raises(ValueError):
+        GreedyPlanner(palette=())
+
+
+def test_nearest_swatch_uses_euclidean_rgb_matching_the_easel():
+    """The guard must predict the swatch the easel would truly paint (Euclidean-RGB
+    nearest), or it could green-light a move that lands a different, worse color."""
+    p = GreedyPlanner(palette=PALETTE)
+    assert p._nearest_swatch((250, 10, 10)) == (255, 0, 0)     # -> red
+    assert p._nearest_swatch((10, 10, 250)) == (0, 0, 255)     # -> blue
+    assert p._nearest_swatch((30, 25, 20)) == (17, 17, 17)     # -> near-black

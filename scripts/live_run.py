@@ -46,7 +46,7 @@ from core.planner import GreedyPlanner  # noqa: E402
 from core.target import Target  # noqa: E402
 from core.verifier import Verifier  # noqa: E402
 from dashboard.publisher import WebsocketPublisher  # noqa: E402
-from easels.browser_canvas import BrowserCanvasEasel  # noqa: E402
+from easels.browser_canvas import PALETTE, BrowserCanvasEasel  # noqa: E402
 
 # A deliberately COOPERATIVE demo target (see the M7.4 rerun notes):
 #
@@ -207,7 +207,7 @@ def main() -> int:
 
         sink = FanoutSink([ConsoleSink(easel, out_dir), publisher])
         orch = Orchestrator(
-            easel, target, GreedyPlanner(), Executor(easel), Verifier(), sink,
+            easel, target, GreedyPlanner(palette=PALETTE), Executor(easel), Verifier(), sink,
             grid_n=GRID_N, max_iterations=MAX_ITERATIONS,
         )
         result = orch.run()
