@@ -44,6 +44,21 @@ def test_palette_colors_match_page():
     assert parsed == BC.PALETTE
 
 
+def test_width_presets_match_page():
+    """The JS `WIDTHS` array must match WIDTH_PRESETS, in order."""
+    html = _html()
+    m = re.search(r"const\s+WIDTHS\s*=\s*\[([^\]]*)\]", html, re.DOTALL)
+    assert m, "WIDTHS array not found in page"
+    parsed = []
+    for name, width, color in re.findall(
+        r"\{name:\s*'([^']+)',\s*width:\s*([0-9.]+),\s*color:\s*'(#[0-9a-fA-F]{6})'\}",
+        m.group(1),
+    ):
+        parsed.append((name, float(width), _hex_to_rgb(color)))
+    expected = [(p.name, p.width, p.locator_color) for p in BC.WIDTH_PRESETS]
+    assert parsed == expected
+
+
 def test_fiducial_geometry_matches_inset():
     """Guard FIDUCIAL_INSET against silent drift from the page's layout (the F2
     geometry). FIDUCIAL_INSET = -15.0 is correct ONLY because it was hand-derived from

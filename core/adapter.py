@@ -165,6 +165,11 @@ class Easel(ABC):
         possible, then lay the stroke via synthetic input. Returns nothing — the core
         observes the effect by calling ``capture`` again."""
 
+    def realizable_width(self, requested: float) -> float:
+        """Brush width (canvas px) actually realized for a stroke requesting
+        ``requested``. Default: identity, for continuous-width environments."""
+        return requested
+
     def undo(self) -> None:
         """Reverse the most recent stroke, if supported. Default: unsupported. Only
         call when ``capabilities().has_undo`` is True."""

@@ -144,6 +144,10 @@ def test_undo_unsupported_by_default():
         e.undo()
 
 
+def test_realizable_width_defaults_to_identity():
+    assert FakeEasel().realizable_width(7.5) == 7.5
+
+
 def test_context_manager_closes():
     with FakeEasel() as e:
         assert not e.closed

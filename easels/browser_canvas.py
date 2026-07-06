@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -68,6 +69,21 @@ FIDUCIAL_COLORS = {
     "br": (0, 255, 0),     # green    bottom-right
 }
 PALETTE: Tuple[Color, ...] = ((255, 0, 0), (0, 0, 255), (17, 17, 17))  # red/blue/black
+
+
+@dataclass(frozen=True)
+class WidthPreset:
+    name: str
+    width: float
+    locator_color: Color
+
+
+WIDTH_PRESETS: Tuple[WidthPreset, ...] = (
+    WidthPreset("thin", 4.0, (255, 140, 0)),
+    WidthPreset("medium", 12.0, (140, 0, 210)),
+    WidthPreset("thick", 24.0, (0, 150, 150)),
+)
+
 # Fiducials live in the frame padding OUTSIDE the paintable canvas (see index.html),
 # so a stroke can never overwrite them. Each centroid sits 15 canvas-px diagonally
 # *outside* its corner -> a negative inset (the dst quad expands beyond the canvas).
@@ -82,9 +98,15 @@ CANVAS_SIZE = (600, 600)    # canvas-space frame, matches the page's CSS canvas
 # swatch" bugs: dark window chrome, a dark-themed editor, or the taskbar are all large
 # near-black regions that otherwise beat the tiny (44px) near-black swatch and steal the
 # click. Coordinates are CANVAS pixels (CSS-px offsets from the canvas top-left, which
-# the canvas homography maps to the screen); the box wraps the three swatches (canvas
-# x 657..701, y -33..119) with ~14px of margin.
+# the canvas homography maps to the screen); the box wraps the three swatches with
+# ~14px of margin.
+CONTROL_COLUMN_WIDTH_CANVAS = 44.0
+CONTROL_COLUMN_GAP_CANVAS = 24.0
 PALETTE_REGION_CANVAS = (643.0, -47.0, 715.0, 133.0)  # (x0, y0, x1, y1) in canvas px
+WIDTH_REGION_CANVAS = tuple(
+    x + CONTROL_COLUMN_WIDTH_CANVAS + CONTROL_COLUMN_GAP_CANVAS if i in (0, 2) else x
+    for i, x in enumerate(PALETTE_REGION_CANVAS)
+)
 
 # Timing that reliably registers input in the browser (from FINDINGS).
 _MOVE_DT = 0.03
@@ -101,6 +123,14 @@ def nearest_palette_color(requested: Color, palette: Tuple[Color, ...] = PALETTE
     realized one by re-capture, so an approximation here is fine."""
     r = np.array(requested, dtype=float)
     return min(palette, key=lambda c: float(np.sum((np.array(c, dtype=float) - r) ** 2)))
+
+
+def nearest_width_preset(
+    requested: float,
+    presets: Tuple[WidthPreset, ...] = WIDTH_PRESETS,
+) -> WidthPreset:
+    """Pick the discrete width preset nearest the requested canvas-pixel width."""
+    return min(presets, key=lambda p: abs(p.width - requested))
 
 
 class BrowserCanvasEasel(Easel):
@@ -130,6 +160,9 @@ class BrowserCanvasEasel(Easel):
 
     def canvas_size(self) -> Tuple[int, int]:
         return self._canvas_size
+
+    def realizable_width(self, requested: float) -> float:
+        return nearest_width_preset(requested).width
 
     # --- perception --------------------------------------------------------------
     def _locate_canvas(self, retries: int = 8, delay: float = 0.4):
@@ -165,11 +198,17 @@ class BrowserCanvasEasel(Easel):
         screen, corners = self._locate_canvas()
         _, h_c2s = G.canvas_homographies(corners, self._canvas_size, FIDUCIAL_INSET)
 
-        # 1. Realize the brush color by clicking the nearest palette swatch. Search
-        #    with the canvas region masked out, so already-painted pixels of that
-        #    color can't be mistaken for the swatch. A swatch that cannot be located
-        #    is a hard failure: painting on with an unknown active color would be a
-        #    silent, unverifiable color error, so we raise rather than guess.
+        # 1. Realize the brush width and color by clicking the nearest controls. Both
+        #    controls are located by vision-searching restricted screen regions
+        #    projected through the canvas homography. A missing control is a hard
+        #    failure: painting on with an unknown brush would be a silent,
+        #    unverifiable error, so we raise rather than guess.
+        width = nearest_width_preset(stroke.brush.size)
+        width_loc = self._locate_width_button(screen, h_c2s, width.locator_color)
+        if width_loc is None:
+            raise LookupError(f"width button for preset {width.name} not found on screen")
+        self._click(int(width_loc[0]), int(width_loc[1]))
+
         swatch = nearest_palette_color(stroke.brush.color)
         loc = self._locate_swatch(screen, h_c2s, swatch)
         if loc is None:
@@ -177,10 +216,6 @@ class BrowserCanvasEasel(Easel):
         self._click(int(loc[0]), int(loc[1]))
 
         # 2. Map the canvas-space path to screen pixels and drag it.
-        #    NOTE: BrushSpec.size is intentionally NOT realized here. The reference
-        #    page hardcodes lineWidth=12; wiring variable stroke width is deferred to
-        #    M5 (motion), where varied widths first get generated. No core path may
-        #    assume brush size takes effect until then.
         screen_path = [G.apply_homography((p.x, p.y), h_c2s) for p in stroke.path]
         self._drag([(int(x), int(y)) for (x, y) in screen_path])
 
@@ -192,13 +227,13 @@ class BrowserCanvasEasel(Easel):
         raw = np.array(self._sct.grab(mon))     # BGRA
         return raw[:, :, [2, 1, 0]].copy()      # -> RGB
 
-    def _palette_region(self, h_c2s, screen_shape):
-        """Screen-pixel bounding box of the palette strip, from ``PALETTE_REGION_CANVAS``
+    def _project_canvas_region(self, region_canvas, h_c2s, screen_shape):
+        """Screen-pixel bounding box of a canvas-space control strip,
         mapped through the canvas->screen homography and clipped to the capture. Returns
         ``(x0, y0, x1, y1)`` or ``None`` if it falls entirely off-screen."""
         from easels import _geometry as G
 
-        x0c, y0c, x1c, y1c = PALETTE_REGION_CANVAS
+        x0c, y0c, x1c, y1c = region_canvas
         pts = [
             G.apply_homography(c, h_c2s)
             for c in ((x0c, y0c), (x1c, y0c), (x0c, y1c), (x1c, y1c))
@@ -214,6 +249,12 @@ class BrowserCanvasEasel(Easel):
             return None
         return x0, y0, x1, y1
 
+    def _palette_region(self, h_c2s, screen_shape):
+        return self._project_canvas_region(PALETTE_REGION_CANVAS, h_c2s, screen_shape)
+
+    def _width_region(self, h_c2s, screen_shape):
+        return self._project_canvas_region(WIDTH_REGION_CANVAS, h_c2s, screen_shape)
+
     def _locate_swatch(self, screen, h_c2s, swatch: Color):
         from easels import _geometry as G
 
@@ -226,6 +267,18 @@ class BrowserCanvasEasel(Easel):
             return None
         rx0, ry0, rx1, ry1 = region
         hit = G.find_color_centroid(screen[ry0:ry1, rx0:rx1], swatch)
+        if hit is None:
+            return None
+        return (hit[0] + rx0, hit[1] + ry0)  # crop-local -> screen coords
+
+    def _locate_width_button(self, screen, h_c2s, color: Color):
+        from easels import _geometry as G
+
+        region = self._width_region(h_c2s, screen.shape)
+        if region is None:
+            return None
+        rx0, ry0, rx1, ry1 = region
+        hit = G.find_color_centroid(screen[ry0:ry1, rx0:rx1], color)
         if hit is None:
             return None
         return (hit[0] + rx0, hit[1] + ry0)  # crop-local -> screen coords

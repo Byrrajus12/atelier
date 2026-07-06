@@ -16,6 +16,12 @@ CENTROIDS = {"tl": (100, 50), "tr": (500, 50), "bl": (100, 450), "br": (500, 450
 # right of the canvas), since swatch search is now restricted to that strip. This is the
 # red swatch's canvas-space center (~679, -11) mapped through the CENTROIDS homography.
 RED_SWATCH_XY = (541, 53)
+# Width buttons live in the next projected control strip to the right of the palette.
+WIDTH_BUTTON_XY = {
+    "thin": (584, 53),
+    "medium": (584, 87),
+    "thick": (584, 121),
+}
 
 
 def make_screen(paint_canvas_red=False):
@@ -26,6 +32,10 @@ def make_screen(paint_canvas_red=False):
     # Red palette swatch OUTSIDE the canvas (to the right).
     sx, sy = RED_SWATCH_XY
     img[sy - 12:sy + 13, sx - 12:sx + 13] = (255, 0, 0)
+    # Width preset buttons OUTSIDE the canvas, in their own restricted search strip.
+    for preset in BC.WIDTH_PRESETS:
+        wx, wy = WIDTH_BUTTON_XY[preset.name]
+        img[wy - 12:wy + 13, wx - 12:wx + 13] = preset.locator_color
     if paint_canvas_red:
         # A big red blob INSIDE the canvas — must not be mistaken for the swatch.
         img[200:300, 200:400] = (255, 0, 0)
@@ -46,6 +56,15 @@ def test_nearest_palette_color(requested, expected):
     assert BC.nearest_palette_color(requested) == expected
 
 
+@pytest.mark.parametrize("requested,expected", [
+    (1.0, "thin"),
+    (10.0, "medium"),
+    (18.1, "thick"),
+])
+def test_nearest_width_preset(requested, expected):
+    assert BC.nearest_width_preset(requested).name == expected
+
+
 def test_capabilities_declare_no_undo():
     caps = make_easel().capabilities()
     assert caps.reversible is False
@@ -55,6 +74,10 @@ def test_capabilities_declare_no_undo():
 
 def test_canvas_size_default():
     assert make_easel().canvas_size() == (600, 600)
+
+
+def test_realizable_width_uses_nearest_preset():
+    assert make_easel().realizable_width(18.1) == 24.0
 
 
 # --- capture localizes the canvas ------------------------------------------------
@@ -74,8 +97,8 @@ def test_capture_returns_canvas_space_frame():
     assert patch[:, :, 1].mean() > 120  # green channel present
 
 
-# --- apply_stroke: color selection + path mapping --------------------------------
-def test_apply_stroke_selects_swatch_and_maps_path():
+# --- apply_stroke: width/color selection + path mapping --------------------------
+def test_apply_stroke_selects_width_and_swatch_and_maps_path():
     e = make_easel()
     screen = make_screen()
     e._grab_screen = lambda: screen
@@ -87,10 +110,14 @@ def test_apply_stroke_selects_swatch_and_maps_path():
     path = (Point(300, 300), Point(400, 350))
     e.apply_stroke(Stroke(path=path, brush=BrushSpec(color=(240, 5, 5), size=10)))
 
+    # Clicked the medium width button (nearest preset to the requested size).
+    assert len(clicks) == 2
+    assert clicks[0][0] == pytest.approx(WIDTH_BUTTON_XY["medium"][0], abs=2)
+    assert clicks[0][1] == pytest.approx(WIDTH_BUTTON_XY["medium"][1], abs=2)
+
     # Clicked the red swatch (nearest palette color to the requested near-red).
-    assert len(clicks) == 1
-    assert clicks[0][0] == pytest.approx(RED_SWATCH_XY[0], abs=2)
-    assert clicks[0][1] == pytest.approx(RED_SWATCH_XY[1], abs=2)
+    assert clicks[1][0] == pytest.approx(RED_SWATCH_XY[0], abs=2)
+    assert clicks[1][1] == pytest.approx(RED_SWATCH_XY[1], abs=2)
 
     # Dragged the canvas path mapped through the canvas->screen homography.
     corners = G.find_fiducials(screen, FIDUCIALS)
@@ -110,8 +137,8 @@ def test_apply_stroke_ignores_painted_pixels_when_locating_swatch():
     e._drag = lambda pts: None
 
     e.apply_stroke(Stroke(path=(Point(300, 300),), brush=BrushSpec(color=(255, 0, 0))))
-    assert clicks[0][0] == pytest.approx(RED_SWATCH_XY[0], abs=2)
-    assert clicks[0][1] == pytest.approx(RED_SWATCH_XY[1], abs=2)
+    assert clicks[1][0] == pytest.approx(RED_SWATCH_XY[0], abs=2)
+    assert clicks[1][1] == pytest.approx(RED_SWATCH_XY[1], abs=2)
 
 
 def test_locate_swatch_restricted_to_palette_strip_ignores_dark_distractor():
@@ -155,18 +182,42 @@ def test_apply_stroke_raises_when_swatch_missing():
         e.apply_stroke(Stroke(path=(Point(300, 300),), brush=BrushSpec(color=(255, 0, 0))))
 
 
-def test_brush_size_not_yet_realized():
-    """BrushSpec.size is defined in the contract but the reference page hardcodes
-    lineWidth=12; realizing variable width is deferred to M5 (F1). Pin that no realized
-    stroke depends on brush size, so no core code can assume size takes effect yet."""
+def test_apply_stroke_raises_when_width_button_missing():
+    """A missing width button is a hard failure: the Easel must not silently paint on
+    with an unknown active width."""
+    e = make_easel()
+    screen = make_screen()
+    wx, wy = WIDTH_BUTTON_XY["thick"]
+    screen[wy - 14:wy + 15, wx - 14:wx + 15] = 0  # erase the thick width button
+    e._grab_screen = lambda: screen
+    e._click = lambda x, y: None
+    e._drag = lambda pts: None
+
+    with pytest.raises(LookupError):
+        e.apply_stroke(
+            Stroke(path=(Point(300, 300),), brush=BrushSpec(color=(255, 0, 0), size=24))
+        )
+
+
+def test_brush_size_selects_different_width_presets_without_changing_path():
+    """BrushSpec.size now selects the nearest width preset before the same canvas path
+    is dragged."""
     e = make_easel()
     screen = make_screen()
     e._grab_screen = lambda: screen
-    e._click = lambda x, y: None
+    clicks = []
+    e._click = lambda x, y: clicks.append((x, y))
     drags = []
     e._drag = lambda pts: drags.append(pts)
 
     path = (Point(200, 200), Point(400, 400))
     e.apply_stroke(Stroke(path=path, brush=BrushSpec(color=(255, 0, 0), size=4)))
-    e.apply_stroke(Stroke(path=path, brush=BrushSpec(color=(255, 0, 0), size=40)))
-    assert drags[0] == drags[1]  # brush size has no effect on the realized stroke (yet)
+    e.apply_stroke(Stroke(path=path, brush=BrushSpec(color=(255, 0, 0), size=24)))
+
+    assert clicks[0][0] == pytest.approx(WIDTH_BUTTON_XY["thin"][0], abs=2)
+    assert clicks[0][1] == pytest.approx(WIDTH_BUTTON_XY["thin"][1], abs=2)
+    assert clicks[2][0] == pytest.approx(WIDTH_BUTTON_XY["thick"][0], abs=2)
+    assert clicks[2][1] == pytest.approx(WIDTH_BUTTON_XY["thick"][1], abs=2)
+    assert clicks[1][0] == pytest.approx(RED_SWATCH_XY[0], abs=2)
+    assert clicks[3][0] == pytest.approx(RED_SWATCH_XY[0], abs=2)
+    assert drags[0] == drags[1]

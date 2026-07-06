@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from core.adapter import BrushSpec, Capabilities, Easel, Frame, Stroke
-from core.executor import Executor, scanline_fill
+from core.executor import DEFAULT_BRUSH_WIDTH, DEFAULT_SPACING, Executor, scanline_fill
 from core.planner import PaintIntent
 
 
@@ -29,6 +29,15 @@ class RecordingEasel(Easel):
 
     def apply_stroke(self, stroke: Stroke) -> None:
         self.strokes.append(stroke)
+
+
+class FixedWidthEasel(RecordingEasel):
+    def __init__(self, realized_width, size=(600, 600)):
+        super().__init__(size=size)
+        self.realized_width = realized_width
+
+    def realizable_width(self, requested: float) -> float:
+        return self.realized_width
 
 
 def intent(box, color=(200, 40, 60)):
@@ -105,6 +114,29 @@ def test_executor_paints_one_stroke_with_intent_color():
     assert laid.brush.color == (10, 220, 30)   # realizes the intent's color
 
 
+def test_executor_default_geometry_matches_previous_fixed_width():
+    easel = RecordingEasel()
+    box = (100, 50, 140, 90)
+    Executor(easel, max_step_px=1000.0).execute(intent(box))
+    assert easel.strokes[0].path == scanline_fill(
+        box,
+        spacing=DEFAULT_SPACING,
+        brush_width=DEFAULT_BRUSH_WIDTH,
+    )
+
+
+def test_executor_spacing_derives_from_realized_width():
+    easel = FixedWidthEasel(realized_width=24.0)
+    box = (0, 0, 37, 37)
+    it = PaintIntent(cell=(0, 0), box=box, color=(1, 2, 3), error=0.5, size=4.0)
+    Executor(easel, max_step_px=1000.0).execute(it)
+    assert easel.strokes[0].path == scanline_fill(
+        box,
+        spacing=20.0,
+        brush_width=24.0,
+    )
+
+
 def test_executor_fill_stays_on_the_intent_box():
     easel = RecordingEasel()
     box = (100, 50, 140, 90)
@@ -138,10 +170,8 @@ def test_executor_size_hint_passed_through():
 def test_executor_rejects_bad_params():
     easel = RecordingEasel()
     with pytest.raises(ValueError):
-        Executor(easel, brush_width=0)
+        Executor(easel, spacing_ratio=0)
     with pytest.raises(ValueError):
-        Executor(easel, spacing=0)
-    with pytest.raises(ValueError):
-        Executor(easel, spacing=20, brush_width=12)  # passes wouldn't overlap
+        Executor(easel, spacing_ratio=1.1)
     with pytest.raises(ValueError):
         Executor(easel, max_step_px=0)

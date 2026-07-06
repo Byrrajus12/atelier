@@ -16,9 +16,8 @@ behind ``apply_stroke``. Everything here is domain-agnostic geometry over a box
 (Principle 2). It paints ONE intent; the repeating plan->execute->re-observe loop is the
 orchestrator's job (M7), not the executor's.
 
-Brush size is assumed ~12 px (``BrushSpec.size`` is still unrealized by the reference
-easel); coverage is designed around that fixed width and confirmed by re-capture, not by
-trusting ``size``.
+Brush size is realized through the ``Easel`` interface. The executor asks the Easel what
+width will actually land, then spaces scanlines as a fixed ratio of that realized width.
 """
 
 from __future__ import annotations
@@ -78,27 +77,22 @@ class Executor:
     def __init__(
         self,
         easel: Easel,
-        brush_width: float = DEFAULT_BRUSH_WIDTH,
-        spacing: float = DEFAULT_SPACING,
+        spacing_ratio: float = DEFAULT_SPACING / DEFAULT_BRUSH_WIDTH,
         max_step_px: float = DEFAULT_MAX_STEP_PX,
     ):
-        if brush_width <= 0:
-            raise ValueError("brush_width must be > 0")
-        if spacing <= 0:
-            raise ValueError("spacing must be > 0")
-        if spacing > brush_width:
-            # coverage guarantee would break: passes wouldn't overlap.
-            raise ValueError("spacing must be <= brush_width so passes overlap")
+        if spacing_ratio <= 0 or spacing_ratio > 1:
+            raise ValueError("spacing_ratio must be > 0 and <= 1")
         if max_step_px <= 0:
             raise ValueError("max_step_px must be > 0")
         self._easel = easel
-        self.brush_width = brush_width
-        self.spacing = spacing
+        self.spacing_ratio = spacing_ratio
         self.max_step_px = max_step_px
 
     def execute(self, intent: PaintIntent) -> List[Stroke]:
         """Paint ``intent``'s region and return the ``Stroke``(s) applied."""
-        raw = scanline_fill(intent.box, self.spacing, self.brush_width)
+        brush_width = self._easel.realizable_width(intent.size)
+        spacing = brush_width * self.spacing_ratio
+        raw = scanline_fill(intent.box, spacing, brush_width)
         path = densify(raw, self.max_step_px)
         stroke = Stroke(path=path, brush=BrushSpec(color=intent.color, size=intent.size))
         self._easel.apply_stroke(stroke)
