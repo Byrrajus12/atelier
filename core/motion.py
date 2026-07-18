@@ -27,7 +27,7 @@ from typing import Sequence, Tuple
 
 from core.adapter import Point
 
-DEFAULT_MAX_STEP_PX = 6.0  # max canvas px between consecutive samples (watchability knob)
+DEFAULT_MAX_STEP_PX = 7.0  # max canvas px between consecutive samples (watchability knob)
 
 
 def densify(

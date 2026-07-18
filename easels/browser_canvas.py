@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -193,6 +193,15 @@ class BrowserCanvasEasel(Easel):
 
     # --- action ------------------------------------------------------------------
     def apply_stroke(self, stroke: Stroke) -> None:
+        self.apply_strokes((stroke,))
+
+    def apply_strokes(self, strokes: Sequence[Stroke]) -> None:
+        if not strokes:
+            return
+        brush = strokes[0].brush
+        if any(stroke.brush != brush for stroke in strokes):
+            raise ValueError("BrowserCanvasEasel.apply_strokes requires one shared brush")
+
         from easels import _geometry as G
 
         screen, corners = self._locate_canvas()
@@ -203,21 +212,22 @@ class BrowserCanvasEasel(Easel):
         #    projected through the canvas homography. A missing control is a hard
         #    failure: painting on with an unknown brush would be a silent,
         #    unverifiable error, so we raise rather than guess.
-        width = nearest_width_preset(stroke.brush.size)
+        width = nearest_width_preset(brush.size)
         width_loc = self._locate_width_button(screen, h_c2s, width.locator_color)
         if width_loc is None:
             raise LookupError(f"width button for preset {width.name} not found on screen")
         self._click(int(width_loc[0]), int(width_loc[1]))
 
-        swatch = nearest_palette_color(stroke.brush.color)
+        swatch = nearest_palette_color(brush.color)
         loc = self._locate_swatch(screen, h_c2s, swatch)
         if loc is None:
             raise LookupError(f"palette swatch for color {swatch} not found on screen")
         self._click(int(loc[0]), int(loc[1]))
 
-        # 2. Map the canvas-space path to screen pixels and drag it.
-        screen_path = [G.apply_homography((p.x, p.y), h_c2s) for p in stroke.path]
-        self._drag([(int(x), int(y)) for (x, y) in screen_path])
+        # 2. Map the canvas-space paths to screen pixels and drag them.
+        for stroke in strokes:
+            screen_path = [G.apply_homography((p.x, p.y), h_c2s) for p in stroke.path]
+            self._drag([(int(x), int(y)) for (x, y) in screen_path])
 
     # --- environment plumbing ----------------------------------------------------
     def _grab_screen(self) -> np.ndarray:

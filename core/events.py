@@ -131,7 +131,7 @@ class VerifyDone(Event):
 
 @dataclass(frozen=True)
 class StateUpdate(Event):
-    """A running summary after an iteration: how many strokes so far, the current global
+    """A running summary after an iteration: how many paint intents so far, the current global
     error, and whether the loop is still running or finished."""
 
     type: ClassVar[str] = "state.update"

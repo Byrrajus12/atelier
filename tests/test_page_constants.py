@@ -59,6 +59,19 @@ def test_width_presets_match_page():
     assert parsed == expected
 
 
+def test_pointerdown_paints_single_point_dab():
+    """A one-point Stroke produces a visible mark: the page paints a brush-radius dab
+    on pointerup only when no pointermove events arrived. Drag strokes must not get
+    circular endpoint dabs, because those would reintroduce lateral bleed."""
+    html = _html()
+    assert "function dab(p)" in html
+    assert "ctx.arc(p.x, p.y, currentWidth / 2" in html
+    assert "if (drawing && !moved && last) dab(last);" in html
+    pointerdown = html[html.index("canvas.addEventListener('pointerdown'"):]
+    pointerdown = pointerdown[:pointerdown.index("canvas.addEventListener('pointermove'")]
+    assert "dab(" not in pointerdown
+
+
 def test_fiducial_geometry_matches_inset():
     """Guard FIDUCIAL_INSET against silent drift from the page's layout (the F2
     geometry). FIDUCIAL_INSET = -15.0 is correct ONLY because it was hand-derived from

@@ -138,6 +138,16 @@ def test_fake_easel_records_and_captures():
     assert e.strokes == [stroke]
 
 
+def test_apply_strokes_defaults_to_apply_stroke_loop():
+    e = FakeEasel()
+    strokes = (
+        Stroke(path=(Point(1, 1), Point(2, 2)), brush=BrushSpec(color=(9, 9, 9))),
+        Stroke(path=(Point(3, 3), Point(4, 4)), brush=BrushSpec(color=(9, 9, 9))),
+    )
+    e.apply_strokes(strokes)
+    assert e.strokes == list(strokes)
+
+
 def test_undo_unsupported_by_default():
     e = FakeEasel()
     with pytest.raises(UnsupportedOperation):

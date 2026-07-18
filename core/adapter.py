@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import NamedTuple, Tuple
+from typing import NamedTuple, Sequence, Tuple
 
 import numpy as np
 
@@ -164,6 +164,16 @@ class Easel(ABC):
         """Realize ``stroke`` on the canvas: select its brush's color as faithfully as
         possible, then lay the stroke via synthetic input. Returns nothing — the core
         observes the effect by calling ``capture`` again."""
+
+    def apply_strokes(self, strokes: Sequence[Stroke]) -> None:
+        """Realize a batch of strokes that belong to one higher-level paint action.
+
+        The default implementation preserves the original single-stroke contract by
+        applying each stroke independently. Easels with expensive brush realization may
+        override this to select shared controls once, then lay all strokes.
+        """
+        for stroke in strokes:
+            self.apply_stroke(stroke)
 
     def realizable_width(self, requested: float) -> float:
         """Brush width (canvas px) actually realized for a stroke requesting

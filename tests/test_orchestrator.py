@@ -2,8 +2,8 @@
 sink. No browser, no websocket, no real capture: the orchestrator must be entirely
 testable in-process (that is the point of the EventSink boundary and the Easel contract).
 
-FakeEasel holds an in-memory canvas and, on apply_stroke, fills the stroke path's
-bounding box with the brush color (approximating the scanline fill covering a cell), so
+FakeEasel holds an in-memory canvas and, on apply_stroke, fills the grid cell band implied
+by the stroke (approximating the executor's filled intent region), so
 perceived error genuinely drops as regions are painted. ``dead_boxes`` mark pixel
 rectangles the easel refuses to change, making a region permanently unpaintable — used to
 exercise rejection, blacklisting, and the stalled termination.
@@ -80,11 +80,15 @@ class FakeEasel(Easel):
     def apply_stroke(self, stroke):
         xs = [p.x for p in stroke.path]
         ys = [p.y for p in stroke.path]
-        x0, x1 = int(min(xs)), int(max(xs))
-        y0, y1 = int(min(ys)), int(max(ys))
+        x0 = max(0, int(math.floor(min(xs))))
+        x1 = min(self._w, int(math.ceil(max(xs))))
+        cell_h = self._h // N
+        row = min(N - 1, max(0, int(float(np.mean(ys)) // cell_h)))
+        y0 = row * cell_h
+        y1 = self._h if row == N - 1 else (row + 1) * cell_h
         color = np.array(stroke.brush.color, dtype=np.uint8)
-        region = self._canvas[y0 : y1 + 1, x0 : x1 + 1]
-        mask = self._writable[y0 : y1 + 1, x0 : x1 + 1]
+        region = self._canvas[y0:y1, x0:x1]
+        mask = self._writable[y0:y1, x0:x1]
         region[mask] = color
 
     def cell_at(self, i, j):
@@ -168,7 +172,7 @@ def test_budget_termination():
 
     assert result.reason == REASON_BUDGET and result.converged is False
     assert result.iteration == 1
-    assert sum(isinstance(e, ExecuteDone) for e in sink.events) == 1  # exactly one stroke
+    assert sum(isinstance(e, ExecuteDone) for e in sink.events) == 1  # exactly one intent
 
 
 def test_convergence_on_the_last_allowed_stroke_reports_converged_not_budget():

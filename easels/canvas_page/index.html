@@ -83,7 +83,7 @@
 
   // Freehand drawing. clientX/Y -> canvas-internal coords handles devicePixelRatio
   // and display scaling transparently (we never reason in CSS units here).
-  let drawing = false, last = null;
+  let drawing = false, moved = false, last = null;
   function pos(e) {
     const r = canvas.getBoundingClientRect();
     return {
@@ -91,17 +91,26 @@
       y: (e.clientY - r.top) * canvas.height / r.height
     };
   }
+  function dab(p) {
+    ctx.fillStyle = current;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, currentWidth / 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
   canvas.addEventListener('pointerdown', (e) => {
-    drawing = true; last = pos(e);
+    drawing = true; moved = false; last = pos(e);
     ctx.strokeStyle = current; ctx.lineWidth = currentWidth; ctx.lineCap = 'butt'; ctx.lineJoin = 'round';
   });
   canvas.addEventListener('pointermove', (e) => {
     if (!drawing) return;
     const p = pos(e);
     ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(p.x, p.y); ctx.stroke();
-    last = p;
+    moved = true; last = p;
   });
-  window.addEventListener('pointerup', () => { drawing = false; last = null; });
+  window.addEventListener('pointerup', () => {
+    if (drawing && !moved && last) dab(last);
+    drawing = false; moved = false; last = null;
+  });
 </script>
 </body>
 </html>

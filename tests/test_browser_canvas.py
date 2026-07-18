@@ -126,6 +126,62 @@ def test_apply_stroke_selects_width_and_swatch_and_maps_path():
     assert drags == [expected]
 
 
+def test_apply_stroke_maps_non_rectilinear_path_sequence():
+    """The Easel accepts arbitrary sampled polylines; scanlines are only what the
+    current executor emits."""
+    e = make_easel()
+    screen = make_screen()
+    e._grab_screen = lambda: screen
+    e._click = lambda x, y: None
+    drags = []
+    e._drag = lambda pts: drags.append(pts)
+
+    path = (
+        Point(120, 180),
+        Point(180, 225),
+        Point(145, 310),
+        Point(260, 285),
+    )
+    e.apply_stroke(Stroke(path=path, brush=BrushSpec(color=(255, 0, 0), size=12)))
+
+    corners = G.find_fiducials(screen, FIDUCIALS)
+    _, h_c2s = G.canvas_homographies(corners, (600, 600), BC.FIDUCIAL_INSET)
+    expected = [tuple(int(v) for v in G.apply_homography((p.x, p.y), h_c2s)) for p in path]
+    assert drags == [expected]
+
+
+def test_apply_strokes_selects_controls_once_then_drags_all_paths():
+    e = make_easel()
+    screen = make_screen()
+    e._grab_screen = lambda: screen
+
+    clicks, drags = [], []
+    e._click = lambda x, y: clicks.append((x, y))
+    e._drag = lambda pts: drags.append(pts)
+
+    strokes = (
+        Stroke(path=(Point(200, 200), Point(400, 200)), brush=BrushSpec(color=(255, 0, 0), size=12)),
+        Stroke(path=(Point(400, 212), Point(200, 212)), brush=BrushSpec(color=(255, 0, 0), size=12)),
+    )
+    e.apply_strokes(strokes)
+
+    assert len(clicks) == 2
+    assert clicks[0][0] == pytest.approx(WIDTH_BUTTON_XY["medium"][0], abs=2)
+    assert clicks[1][0] == pytest.approx(RED_SWATCH_XY[0], abs=2)
+    assert len(drags) == 2
+
+
+def test_apply_strokes_rejects_mismatched_brush_batch():
+    e = make_easel()
+    strokes = (
+        Stroke(path=(Point(200, 200), Point(400, 200)), brush=BrushSpec(color=(255, 0, 0), size=12)),
+        Stroke(path=(Point(400, 212), Point(200, 212)), brush=BrushSpec(color=(0, 0, 255), size=12)),
+    )
+
+    with pytest.raises(ValueError):
+        e.apply_strokes(strokes)
+
+
 def test_apply_stroke_ignores_painted_pixels_when_locating_swatch():
     """Even with a big red blob painted on the canvas, the swatch outside the canvas
     is the one clicked (canvas region is masked during swatch search)."""

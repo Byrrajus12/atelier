@@ -3,11 +3,11 @@ pieces together and drives them until the canvas converges on the target, emitti
 typed event stream as it goes.
 
 One iteration, and the single load-bearing dataflow decision (ONE capture+observe per
-stroke, not two):
+paint intent, not two):
 
     before = observe(capture())          # baseline, done once before the loop
     intent = planner.plan(before)        # what/where, or None -> done
-    executor.execute(intent)             # lay the strokes through the easel
+    executor.execute(intent)             # lay the intent's strokes through the easel
     after  = observe(capture())          # perceive the result
     verdict = verifier.verify(before, after, intent)
     ... emit events ...
@@ -21,7 +21,7 @@ swallowed so a flaky listener can never kill a paint run.
 
 Two policies beyond the bare loop:
 
-  * **Rejected strokes / blacklisting.** A rejected verdict does NOT trigger an in-place
+  * **Rejected paint intents / blacklisting.** A rejected verdict does NOT trigger an in-place
     retry; the loop simply moves on and the greedy planner re-picks whatever region is
     highest next time (possibly the same one). A per-region failure counter guards
     against hammering an unpaintable region forever: after ``max_region_failures``
@@ -33,9 +33,9 @@ Two policies beyond the bare loop:
   * **Termination**, whichever hits first, each ending with a ``RunDone`` stating why:
     ``converged`` (planner returns None on the true, unmasked grid — nothing worth
     painting), ``stalled_no_progress`` (global error has not dropped by more than
-    ``progress_epsilon`` for ``max_stall_iterations`` consecutive strokes), ``stalled``
+    ``progress_epsilon`` for ``max_stall_iterations`` consecutive paint intents), ``stalled``
     (the planner would still act, but only on blacklisted regions), ``budget``
-    (max-iterations safety cap), or ``canvas_lost`` (capture/stroke kept failing to
+    (max-iterations safety cap), or ``canvas_lost`` (capture/paint kept failing to
     locate the canvas). The unmasked-vs-masked plan comparison distinguishes converged
     from stalled using the planner itself as the threshold oracle, with no new interface.
 
@@ -85,14 +85,14 @@ from core.planner import PaintIntent, Planner
 from core.target import Target
 from core.verifier import Verifier
 
-DEFAULT_MAX_ITERATIONS = 500       # safety cap on strokes; a full loop rarely nears this
+DEFAULT_MAX_ITERATIONS = 500       # safety cap on paint intents; a full loop rarely nears this
 DEFAULT_MAX_REGION_FAILURES = 3    # rejects on one region before it is blacklisted
 DEFAULT_CAPTURE_RETRIES = 3        # extra attempts if capture/stroke can't find the canvas
 DEFAULT_CAPTURE_RETRY_DELAY = 0.5  # seconds between those attempts
 # Stall detector (target-independent stop). A genuine full-cell paint drops global error
 # by far more than this; floor-grinding after the picture is right leaves it essentially
-# flat. So a per-stroke global improvement at or below this epsilon counts as "no
-# progress", and this many consecutive such strokes ends the run.
+# flat. So a per-intent global improvement at or below this epsilon counts as "no
+# progress", and this many consecutive such intents ends the run.
 DEFAULT_PROGRESS_EPSILON = 0.001
 DEFAULT_MAX_STALL_ITERATIONS = 3
 
@@ -164,7 +164,7 @@ class Orchestrator:
         self._failures: Dict[Cell, int] = {}
         self._blacklist: Set[Cell] = set()
         self._last_global: Optional[float] = None
-        self._no_progress = 0  # consecutive strokes with global improvement <= epsilon
+        self._no_progress = 0  # consecutive intents with global improvement <= epsilon
 
     # --- public entry point ------------------------------------------------------
     def run(self) -> RunDone:
@@ -183,17 +183,17 @@ class Orchestrator:
             stroke_cost=caps.stroke_cost,
         ))
 
-        # Baseline perception (iteration 0), before any stroke.
+        # Baseline perception (iteration 0), before any paint.
         try:
             before = self._observe(self._capture(), iteration=0)
         except _CanvasLost:
             return self._finish(0, REASON_CANVAS_LOST, converged=False)
         self._emit(StateUpdate(iteration=0, global_error=before.global_error))
 
-        iteration = 0  # strokes completed
+        iteration = 0  # paint intents completed
         while True:
             # Check "nothing left to do" BEFORE the budget cap. If the canvas converged
-            # (or stalled) on exactly the last allowed stroke, that is the true outcome;
+            # (or stalled) on exactly the last allowed paint intent, that is the true outcome;
             # budget is the safety net for a run that still has work when its allowance
             # runs out, not a pre-emption of an already-finished run.
             intent, stop_reason = self._next_intent(before)

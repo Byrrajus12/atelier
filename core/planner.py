@@ -46,9 +46,9 @@ class PaintIntent:
     error: the region error that drove this pick, in ``[0, 1]`` — carried for
            observability (events/dashboard) and to keep a future model planner's stated
            reasoning tied to the value it actually acted on.
-    size:  brush-size hint in canvas pixels. Carried for contract completeness; the
-           reference executor does not honor it yet (brush size is pinned-unrealized
-           until M5), so coverage reasoning should assume the real ~12px fixed width.
+    size:  brush-size hint in canvas pixels. The executor passes it through the Easel's
+           ``realizable_width`` contract, so discrete-width environments may snap it to
+           the nearest supported brush.
     """
 
     cell: Tuple[int, int]
