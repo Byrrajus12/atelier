@@ -8,6 +8,8 @@ dashboard/.next/
 PRODUCT.md
 DESIGN.md
 AGENTS.md
+.DS_Store
+.claude/settings.local.json
 
 # Throwaway M1 spike artifacts (code + FINDINGS.md stay tracked)
 spike/_spike_profile/
@@ -16,3 +18,10 @@ easels/_easel_profile/
 .playwright-mcp/
 canvas-render-check.png
 .tmp/
+
+# Codex machine-local hooks
+.codex/
+
+# graphify: keep only the report; graph data and caches are regenerated
+graphify-out/*
+!graphify-out/GRAPH_REPORT.md
