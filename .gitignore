@@ -10,6 +10,7 @@ DESIGN.md
 AGENTS.md
 .DS_Store
 .claude/settings.local.json
+graphify-out/
 
 # Throwaway M1 spike artifacts (code + FINDINGS.md stay tracked)
 spike/_spike_profile/
