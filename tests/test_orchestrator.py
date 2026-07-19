@@ -19,11 +19,13 @@ from core.events import (
     REASON_BUDGET,
     REASON_CANVAS_LOST,
     REASON_CONVERGED,
+    REASON_PLANNER_SKIPPED,
     REASON_STALLED,
     REASON_STALLED_NO_PROGRESS,
     STATUS_DONE,
     ExecuteDone,
     PlanDone,
+    PlannerSkipped,
     RecordingSink,
     RunDone,
     RunStart,
@@ -31,7 +33,7 @@ from core.events import (
 from core.executor import Executor
 from core.orchestrator import Orchestrator
 from core.perception import cell_box
-from core.planner import GreedyPlanner
+from core.planner import GreedyPlanner, PaintIntent, PlannerSkip
 from core.target import Target
 from core.verifier import Verifier
 
@@ -328,6 +330,228 @@ def test_constructor_rejects_bad_params():
     args = (easel, target, GreedyPlanner(), Executor(easel), Verifier(), RecordingSink())
     for bad in (dict(grid_n=0), dict(max_iterations=0), dict(max_region_failures=0),
                 dict(capture_retries=-1), dict(capture_retry_delay=-1.0),
-                dict(progress_epsilon=-0.1), dict(max_stall_iterations=0)):
+                dict(progress_epsilon=-0.1), dict(max_stall_iterations=0),
+                dict(max_consecutive_skips=0), dict(observer_palette=())):
         with pytest.raises(ValueError):
             Orchestrator(*args, **bad)
+
+
+# --- non-blocking observer (Phase 1) ---------------------------------------------
+# The observer RECORDS whether a planned move would damage a no-undo canvas; it never
+# blocks one. That is what makes an unconstrained model planner measurable.
+PALETTE = (RED, BLUE, (17, 17, 17))
+
+
+class FixedPlanner(GreedyPlanner):
+    """Emits a scripted sequence of intents regardless of what it perceives, so an
+    unconstrained (possibly self-damaging) choice can be forced deterministically."""
+
+    def __init__(self, intents):
+        super().__init__()
+        self._intents = list(intents)
+
+    def plan(self, observation):
+        return self._intents.pop(0) if self._intents else None
+
+
+def observer_flags(sink):
+    return [e for e in sink.events if e.type == "observer.flag"]
+
+
+def test_observer_is_off_unless_a_palette_is_given():
+    target = make_target({(0, 0): RED, (3, 3): BLUE})
+    sink = RecordingSink()
+    build(FakeEasel(), target, sink).run()
+    assert observer_flags(sink) == []
+
+
+def test_observer_emits_a_flag_for_each_planned_intent():
+    target = make_target({(0, 0): RED, (3, 3): BLUE})
+    sink = RecordingSink()
+    build(FakeEasel(), target, sink, observer_palette=PALETTE).run()
+    flags = observer_flags(sink)
+    plans = [e for e in sink.events if isinstance(e, PlanDone)]
+    assert len(flags) == len(plans) and len(flags) > 0
+    assert [f.cell for f in flags] == [tuple(p.intent.cell) for p in plans]
+
+
+def test_observer_flags_a_self_damaging_move_without_blocking_it():
+    """Painting a white background cell red cannot be undone and provably does not help.
+    The observer must flag it AND the move must still be executed — the planner's choice
+    stands (a guard that silently corrected it would erase the measurement)."""
+    target = make_target({(0, 0): RED})  # cell (2,2) is white background in the target
+    easel = FakeEasel()
+    box = cell_box(2, 2, N, CANVAS)
+    bad = PaintIntent(cell=(2, 2), box=box, color=RED, error=0.9)
+    sink = RecordingSink()
+    Orchestrator(
+        easel, target, FixedPlanner([bad]), Executor(easel), Verifier(), sink,
+        grid_n=N, capture_retry_delay=0.0, observer_palette=PALETTE,
+    ).run()
+
+    flags = observer_flags(sink)
+    assert len(flags) == 1
+    assert flags[0].cell == (2, 2)
+    assert flags[0].self_damaging is True
+    # ...and the paint actually happened anyway: the cell is red, not white.
+    assert np.array_equal(easel.cell_at(2, 2), np.full_like(easel.cell_at(2, 2), RED))
+
+
+def test_observer_does_not_flag_a_genuinely_helpful_move():
+    target = make_target({(0, 0): RED})
+    easel = FakeEasel()
+    good = PaintIntent(cell=(0, 0), box=cell_box(0, 0, N, CANVAS), color=RED, error=0.9)
+    sink = RecordingSink()
+    Orchestrator(
+        easel, target, FixedPlanner([good]), Executor(easel), Verifier(), sink,
+        grid_n=N, capture_retry_delay=0.0, observer_palette=PALETTE,
+    ).run()
+    flags = observer_flags(sink)
+    assert len(flags) == 1
+    assert flags[0].self_damaging is False
+
+
+def test_observer_reports_the_swatch_that_would_actually_be_painted():
+    """The intent asks for a color; the easel snaps it to a palette. The flag must show
+    the color that would truly land, or a consumer misreads what happened."""
+    target = make_target({(0, 0): RED})
+    easel = FakeEasel()
+    # Requests an off-red the palette does not contain; nearest swatch is RED.
+    intent = PaintIntent(cell=(0, 0), box=cell_box(0, 0, N, CANVAS), color=(250, 10, 10), error=0.9)
+    sink = RecordingSink()
+    Orchestrator(
+        easel, target, FixedPlanner([intent]), Executor(easel), Verifier(), sink,
+        grid_n=N, capture_retry_delay=0.0, observer_palette=PALETTE,
+    ).run()
+    flag = observer_flags(sink)[0]
+    assert flag.requested_color == (250, 10, 10)
+    assert flag.predicted_color == RED
+
+
+def test_observer_failure_never_kills_the_run(caplog, monkeypatch):
+    """An observer is pure instrumentation; a fault in it must not cost a paint run — but
+    it must also not vanish silently, or a zero-flag run would be indistinguishable from a
+    perfectly-behaved one and the measurement would be quietly worthless.
+
+    The fault is injected at the exact function the observer calls, so the failure path is
+    explicit rather than relying on some value incidentally raising."""
+    def boom(*args, **kwargs):
+        raise RuntimeError("observer is broken")
+
+    monkeypatch.setattr("core.orchestrator.swatch_would_improve", boom)
+
+    target = make_target({(0, 0): RED, (3, 3): BLUE})
+    easel = FakeEasel()
+    sink = RecordingSink()
+    orch = build(easel, target, sink, observer_palette=PALETTE)
+    with caplog.at_level("WARNING"):
+        result = orch.run()
+
+    # The run still converges and paints correctly...
+    assert result.reason == REASON_CONVERGED and result.converged is True
+    assert np.array_equal(easel._canvas, target.image)
+    # ...no flags were produced, and the failure was reported rather than swallowed.
+    assert observer_flags(sink) == []
+    assert any("observer failed" in r.message for r in caplog.records)
+
+
+# --- PlannerSkip: "I could not decide" is NOT "the canvas is done" ----------------
+# The bug this section guards: a VLM that failed one iteration returned None, the
+# orchestrator read None as convergence, and the run ended reported converged=True at
+# ~13% global error with most cells unpainted. None and PlannerSkip must stay distinct.
+
+
+class SkippingPlanner(GreedyPlanner):
+    """Raises ``PlannerSkip`` on the calls listed in ``skip_on`` (1-indexed), and plans
+    greedily on every other call. ``skip_on=None`` means skip forever — a planner that
+    can never decide, e.g. one whose backing API is down."""
+
+    def __init__(self, skip_on=None):
+        super().__init__()
+        self.skip_on = skip_on
+        self.calls = 0
+
+    def plan(self, observation):
+        self.calls += 1
+        if self.skip_on is None or self.calls in self.skip_on:
+            raise PlannerSkip(f"scripted skip on call {self.calls}")
+        return super().plan(observation)
+
+
+def skip_events(sink):
+    return [e for e in sink.events if isinstance(e, PlannerSkipped)]
+
+
+def test_a_skip_does_not_terminate_the_run_and_the_next_iteration_paints():
+    target = make_target({(0, 0): RED, (3, 3): BLUE})
+    easel = FakeEasel()
+    sink = RecordingSink()
+    result = Orchestrator(
+        easel, target, SkippingPlanner(skip_on={1}), Executor(easel), Verifier(), sink,
+        grid_n=N, capture_retry_delay=0.0,
+    ).run()
+
+    # The skipped first iteration cost the run nothing: it still paints and converges.
+    assert result.reason == REASON_CONVERGED and result.converged is True
+    assert np.array_equal(easel._canvas, target.image)
+    assert sum(isinstance(e, ExecuteDone) for e in sink.events) >= 2
+    # The skip is visible in the stream, and it did not advance the paint counter.
+    assert [(e.iteration, e.consecutive) for e in skip_events(sink)] == [(0, 1)]
+
+
+def test_a_planner_that_never_decides_terminates_unconverged_at_the_true_error():
+    # The regression test for the shipped bug, stated as the requirement: a run that
+    # stopped because the planner could not decide must NOT report converged=True.
+    target = make_target({(0, 0): RED, (0, 1): RED, (3, 3): BLUE})
+    easel = FakeEasel()
+    sink = RecordingSink()
+    result = Orchestrator(
+        easel, target, SkippingPlanner(), Executor(easel), Verifier(), sink,
+        grid_n=N, capture_retry_delay=0.0, max_consecutive_skips=5,
+    ).run()
+
+    assert result.reason == REASON_PLANNER_SKIPPED
+    assert result.converged is False
+    assert result.iteration == 0                    # nothing was ever painted
+    assert result.global_error > 0.02               # and the canvas says so
+    assert sum(isinstance(e, ExecuteDone) for e in sink.events) == 0
+    assert not np.array_equal(easel._canvas, target.image)
+    # It stopped AT the cap, not after spinning forever.
+    assert [e.consecutive for e in skip_events(sink)] == [1, 2, 3, 4, 5]
+    assert sink.events[-2].status == STATUS_DONE and sink.events[-2].converged is False
+
+
+def test_the_skip_counter_counts_consecutive_skips_and_a_decision_resets_it():
+    # Eight skips total, but never five in a row: a transient planner is tolerated
+    # indefinitely as long as it keeps making progress in between.
+    target = make_target({(0, 0): RED, (3, 3): BLUE})
+    easel = FakeEasel()
+    sink = RecordingSink()
+    planner = SkippingPlanner(skip_on={1, 2, 3, 4, 6, 7, 8, 9})
+    result = Orchestrator(
+        easel, target, planner, Executor(easel), Verifier(), sink,
+        grid_n=N, capture_retry_delay=0.0, max_consecutive_skips=5,
+    ).run()
+
+    assert result.reason == REASON_CONVERGED and result.converged is True
+    assert np.array_equal(easel._canvas, target.image)
+    assert len(skip_events(sink)) == 8
+    assert max(e.consecutive for e in skip_events(sink)) == 4  # reset by call 5's decision
+
+
+def test_greedy_returning_none_still_terminates_converged():
+    # The other half of the distinction, guarded explicitly: PlannerSkip must not have
+    # bled into the meaning of None. A planner that returns None IS asserting the canvas
+    # is done, and that claim must still be honored as convergence.
+    from core.perception import observe
+
+    target = make_target({(0, 0): RED})
+    easel = FakeEasel()
+    sink = RecordingSink()
+    result = build(easel, target, sink).run()
+
+    # On the finished canvas the greedy planner returns None — it does not raise.
+    assert GreedyPlanner().plan(observe(easel.capture(), target, n=N)) is None
+    assert result.reason == REASON_CONVERGED and result.converged is True
+    assert result.global_error < 0.02
+    assert skip_events(sink) == []

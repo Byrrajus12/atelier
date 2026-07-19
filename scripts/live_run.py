@@ -17,7 +17,9 @@ domain-agnostic core (CLAUDE.md Scope). Run it from the repo root:  python scrip
 
 from __future__ import annotations
 
+import argparse
 import ctypes
+import logging
 import os
 import sys
 import tempfile
@@ -34,6 +36,8 @@ import cv2  # noqa: E402
 from core.events import (  # noqa: E402
     EventSink,
     ObserveDone,
+    ObserverFlag,
+    PlannerSkipped,
     RunDone,
     RunStart,
     StateUpdate,
@@ -47,6 +51,8 @@ from core.target import Target  # noqa: E402
 from core.verifier import Verifier  # noqa: E402
 from dashboard.publisher import WebsocketPublisher  # noqa: E402
 from easels.browser_canvas import PALETTE, BrowserCanvasEasel  # noqa: E402
+from planners.fireworks_client import HTTPFireworksClient  # noqa: E402
+from planners.vlm_planner import DEFAULT_MODEL, VLMPlanner  # noqa: E402
 
 # A deliberately COOPERATIVE demo target (see the M7.4 rerun notes):
 #
@@ -147,6 +153,18 @@ class ConsoleSink(EventSink):
                   f"cap={event.max_iterations}  reversible={event.reversible}")
         elif isinstance(event, StateUpdate) and event.iteration == 0:
             print(f"iter {event.iteration:3d}  baseline           global={event.global_error:.4f}")
+        elif isinstance(event, PlannerSkipped):
+            # No paint this iteration. Printed so a skipped turn is visible as a skip
+            # rather than a silent gap in the per-iteration output.
+            print(f"iter {event.iteration:3d}  planner skipped     "
+                  f"(consecutive={event.consecutive})")
+        elif isinstance(event, ObserverFlag):
+            # Non-blocking: the planner's move already stands. Printed so a self-damaging
+            # choice is visible live rather than only in a post-run log.
+            if event.self_damaging:
+                print(f"iter {event.iteration:3d}  cell{tuple(event.cell)!s:<8} "
+                      f"OBSERVER: self-damaging (requested {event.requested_color}, "
+                      f"would paint {event.predicted_color}) -- allowed anyway")
         elif isinstance(event, VerifyDone):
             v = event.verdict
             mark = "accept" if v.accepted else "REJECT"
@@ -184,7 +202,41 @@ class FanoutSink(EventSink):
                 pass
 
 
+def build_planner(kind: str, model: str):
+    """Construct the planner for this run. Both implement ``core.planner.Planner``, so
+    everything downstream (executor, easel, verifier, orchestrator) is identical either
+    way — the point of the pluggable planner seat (Principle 6).
+
+    ``greedy`` is the model-free baseline with its no-undo palette guard ON (it skips
+    unpaintable cells). ``vlm`` is UNCONSTRAINED by design: no guard vetoes its choice, and
+    the orchestrator's non-blocking observer records self-damaging moves instead."""
+    if kind == "greedy":
+        return GreedyPlanner(palette=PALETTE)
+    client = HTTPFireworksClient()  # reads FIREWORKS_API_KEY; never committed or logged
+    return VLMPlanner(client, model=model)
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="atelier live convergence run")
+    parser.add_argument(
+        "--planner", choices=("greedy", "vlm"), default="greedy",
+        help="Which planner drives the run (default: greedy, the model-free baseline).",
+    )
+    parser.add_argument(
+        "--model", default=DEFAULT_MODEL,
+        help="Fireworks model id, used only with --planner=vlm.",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Log every VLM request/response and skip at DEBUG level.",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+
     out_dir = os.path.join(tempfile.gettempdir(), f"atelier_live_run_{int(time.time())}")
     os.makedirs(out_dir, exist_ok=True)
     print(f"output folder: {out_dir}")
@@ -206,9 +258,15 @@ def main() -> int:
         _save_rgb(os.path.join(out_dir, "frame_start.png"), easel.capture().image)
 
         sink = FanoutSink([ConsoleSink(easel, out_dir), publisher])
+        planner = build_planner(args.planner, args.model)
+        print(f"planner: {args.planner}"
+              + (f" (model={args.model})" if args.planner == "vlm" else ""))
         orch = Orchestrator(
-            easel, target, GreedyPlanner(palette=PALETTE), Executor(easel), Verifier(), sink,
+            easel, target, planner, Executor(easel), Verifier(), sink,
             grid_n=GRID_N, max_iterations=MAX_ITERATIONS,
+            # The observer only RECORDS self-damaging moves; it never blocks one. This is
+            # how an unconstrained VLM's choices get measured on a no-undo canvas.
+            observer_palette=PALETTE,
         )
         result = orch.run()
 

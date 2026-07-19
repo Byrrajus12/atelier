@@ -12,7 +12,9 @@ from core.planner import (
     GreedyPlanner,
     PaintIntent,
     Planner,
+    nearest_swatch,
     region_mean_color,
+    swatch_would_improve,
 )
 from core.target import Target
 
@@ -236,3 +238,61 @@ def test_nearest_swatch_uses_euclidean_rgb_matching_the_easel():
     assert p._nearest_swatch((250, 10, 10)) == (255, 0, 0)     # -> red
     assert p._nearest_swatch((10, 10, 250)) == (0, 0, 255)     # -> blue
     assert p._nearest_swatch((30, 25, 20)) == (17, 17, 17)     # -> near-black
+
+
+# --- the shared self-damage test (Phase 1) ---------------------------------------
+# Promoted out of GreedyPlanner so the orchestrator's non-blocking observer can apply
+# EXACTLY the same rule the greedy guard uses — one definition, two callers with
+# different powers (skip vs merely record).
+def test_nearest_swatch_function_matches_the_planner_method():
+    for requested in ((250, 10, 10), (10, 10, 250), (30, 25, 20), (128, 128, 128)):
+        assert (
+            nearest_swatch(requested, PALETTE)
+            == GreedyPlanner(palette=PALETTE)._nearest_swatch(requested)
+        )
+
+
+def test_nearest_swatch_rejects_an_empty_palette():
+    with pytest.raises(ValueError):
+        nearest_swatch((0, 0, 0), ())
+
+
+def test_swatch_would_improve_is_false_for_an_unpaintable_white_cell():
+    """The canonical no-undo trap: a white-background cell that no swatch can improve."""
+    canvas = solid(40, 40, (255, 255, 255))
+    target = solid(40, 40, (255, 255, 255))
+    obs = make_observation(canvas, target, np.zeros((2, 2)))
+    assert swatch_would_improve(obs, (0, 0, 20, 20), PALETTE) is False
+
+
+def test_swatch_would_improve_is_true_for_a_paintable_cell():
+    canvas = solid(40, 40, (255, 255, 255))
+    target = solid(40, 40, (255, 255, 255))
+    target[0:20, 0:20] = (255, 0, 0)
+    obs = make_observation(canvas, target, np.zeros((2, 2)))
+    assert swatch_would_improve(obs, (0, 0, 20, 20), PALETTE) is True
+
+
+def test_swatch_would_improve_honors_an_explicitly_requested_color():
+    """The observer passes the planner's REQUESTED color (a model may ask for anything),
+    rather than assuming the target's mean — so a bad requested color must read as
+    self-damaging even where the cell is otherwise paintable."""
+    canvas = solid(40, 40, (255, 255, 255))
+    target = solid(40, 40, (255, 255, 255))
+    target[0:20, 0:20] = (255, 0, 0)  # cell target is red
+    obs = make_observation(canvas, target, np.zeros((2, 2)))
+    box = (0, 0, 20, 20)
+    assert swatch_would_improve(obs, box, PALETTE, (255, 0, 0)) is True   # right color
+    assert swatch_would_improve(obs, box, PALETTE, (0, 0, 255)) is False  # blue on a red target
+
+
+def test_greedy_guard_delegates_to_the_shared_function():
+    """The planner method and the shared function must agree, or the observer would be
+    measuring a different rule than the one the greedy guard enforces."""
+    canvas = solid(40, 40, (255, 255, 255))
+    target = solid(40, 40, (255, 255, 255))
+    target[0:20, 20:40] = (0, 0, 255)
+    obs = make_observation(canvas, target, np.zeros((2, 2)))
+    planner = GreedyPlanner(palette=PALETTE)
+    for box in ((0, 0, 20, 20), (20, 0, 40, 20)):
+        assert planner._swatch_improves(obs, box) == swatch_would_improve(obs, box, PALETTE)

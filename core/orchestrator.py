@@ -34,10 +34,20 @@ Two policies beyond the bare loop:
     ``converged`` (planner returns None on the true, unmasked grid — nothing worth
     painting), ``stalled_no_progress`` (global error has not dropped by more than
     ``progress_epsilon`` for ``max_stall_iterations`` consecutive paint intents), ``stalled``
-    (the planner would still act, but only on blacklisted regions), ``budget``
+    (the planner would still act, but only on blacklisted regions), ``planner_skipped``
+    (the planner failed to decide ``max_consecutive_skips`` times running), ``budget``
     (max-iterations safety cap), or ``canvas_lost`` (capture/paint kept failing to
     locate the canvas). The unmasked-vs-masked plan comparison distinguishes converged
     from stalled using the planner itself as the threshold oracle, with no new interface.
+
+    Only ``converged`` reports ``converged=True``. A planner that raises ``PlannerSkip``
+    is saying "I could not decide", which is not evidence the canvas is done — so a skip
+    is a non-terminating no-op (re-observe, ask again) and the run can end on it only via
+    the explicit skip cap, unconverged. This distinction is load-bearing: a model planner
+    that fails one iteration would otherwise be read as convergence and end a barely-
+    started painting labeled a success. The cap is what stops a planner that fails
+    *forever* from spinning: skips lay no strokes, so they advance neither the iteration
+    budget nor the stall detector, and neither of those would ever fire.
 
     ``stalled_no_progress`` is the robust, target-independent stop. Threshold- and
     blacklist-based termination can grind for a long time when the painting is already as
@@ -52,14 +62,17 @@ Two policies beyond the bare loop:
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Dict, Optional, Set, Tuple
 
 from core.adapter import Easel
+from core.adapter import Color
 from core.events import (
     REASON_BUDGET,
     REASON_CANVAS_LOST,
     REASON_CONVERGED,
+    REASON_PLANNER_SKIPPED,
     REASON_STALLED,
     REASON_STALLED_NO_PROGRESS,
     STATUS_DONE,
@@ -68,7 +81,9 @@ from core.events import (
     ExecuteDone,
     FrameCaptured,
     ObserveDone,
+    ObserverFlag,
     PlanDone,
+    PlannerSkipped,
     RunDone,
     RunStart,
     StateUpdate,
@@ -81,7 +96,13 @@ from core.perception import (
     Observation,
     observe,
 )
-from core.planner import PaintIntent, Planner
+from core.planner import (
+    PaintIntent,
+    Planner,
+    PlannerSkip,
+    nearest_swatch,
+    swatch_would_improve,
+)
 from core.target import Target
 from core.verifier import Verifier
 
@@ -95,8 +116,14 @@ DEFAULT_CAPTURE_RETRY_DELAY = 0.5  # seconds between those attempts
 # progress", and this many consecutive such intents ends the run.
 DEFAULT_PROGRESS_EPSILON = 0.001
 DEFAULT_MAX_STALL_ITERATIONS = 3
+# Consecutive PlannerSkips before the run ends (unconverged). A skip is cheap but not
+# free — a model planner spends its own retries before raising — so this tolerates a
+# transient API hiccup without letting a genuinely dead planner spin forever.
+DEFAULT_MAX_CONSECUTIVE_SKIPS = 5
 
 Cell = Tuple[int, int]
+
+log = logging.getLogger(__name__)
 
 
 class _CanvasLost(Exception):
@@ -130,6 +157,8 @@ class Orchestrator:
         capture_retry_delay: float = DEFAULT_CAPTURE_RETRY_DELAY,
         progress_epsilon: float = DEFAULT_PROGRESS_EPSILON,
         max_stall_iterations: int = DEFAULT_MAX_STALL_ITERATIONS,
+        max_consecutive_skips: int = DEFAULT_MAX_CONSECUTIVE_SKIPS,
+        observer_palette: Optional[Tuple[Color, ...]] = None,
     ) -> None:
         if grid_n < 1:
             raise ValueError("grid_n must be >= 1")
@@ -145,6 +174,10 @@ class Orchestrator:
             raise ValueError("progress_epsilon must be >= 0")
         if max_stall_iterations < 1:
             raise ValueError("max_stall_iterations must be >= 1")
+        if max_consecutive_skips < 1:
+            raise ValueError("max_consecutive_skips must be >= 1")
+        if observer_palette is not None and len(observer_palette) == 0:
+            raise ValueError("observer_palette, if given, must be non-empty")
 
         self._easel = easel
         self._target = target
@@ -160,11 +193,16 @@ class Orchestrator:
         self._capture_retry_delay = capture_retry_delay
         self._progress_epsilon = progress_epsilon
         self._max_stall_iterations = max_stall_iterations
+        self._max_consecutive_skips = max_consecutive_skips
+        self._observer_palette = (
+            tuple(observer_palette) if observer_palette is not None else None
+        )
 
         self._failures: Dict[Cell, int] = {}
         self._blacklist: Set[Cell] = set()
         self._last_global: Optional[float] = None
         self._no_progress = 0  # consecutive intents with global improvement <= epsilon
+        self._skips = 0        # consecutive PlannerSkips; any decision resets it
 
     # --- public entry point ------------------------------------------------------
     def run(self) -> RunDone:
@@ -196,16 +234,33 @@ class Orchestrator:
             # (or stalled) on exactly the last allowed paint intent, that is the true outcome;
             # budget is the safety net for a run that still has work when its allowance
             # runs out, not a pre-emption of an already-finished run.
-            intent, stop_reason = self._next_intent(before)
+            try:
+                intent, stop_reason = self._next_intent(before)
+            except PlannerSkip:
+                # The planner could not decide — which says nothing about the canvas, so
+                # this must NOT end the run as converged. Re-observe and ask again; only
+                # the consecutive-skip cap stops us, and it stops us unconverged.
+                self._skips += 1
+                self._emit(PlannerSkipped(iteration=iteration, consecutive=self._skips))
+                if self._skips >= self._max_consecutive_skips:
+                    return self._finish(iteration, REASON_PLANNER_SKIPPED, converged=False)
+                try:
+                    before = self._observe(self._capture(), iteration=iteration)
+                except _CanvasLost:
+                    return self._finish(iteration, REASON_CANVAS_LOST, converged=False)
+                continue
+
             if intent is None:
                 return self._finish(
                     iteration, stop_reason, converged=(stop_reason == REASON_CONVERGED)
                 )
+            self._skips = 0  # a decision was reached; earlier skips were transient
             if iteration >= self._max_iterations:
                 return self._finish(iteration, REASON_BUDGET, converged=False)
 
             stroke_no = iteration + 1
             self._emit(PlanDone(iteration=stroke_no, intent=intent))
+            self._observe_intent(stroke_no, intent, before)
 
             try:
                 strokes = self._execute(intent)
@@ -261,6 +316,48 @@ class Orchestrator:
         if masked is None:
             return None, REASON_STALLED
         return masked, None
+
+    # --- non-blocking observer ---------------------------------------------------
+    def _observe_intent(
+        self, iteration: int, intent: PaintIntent, before: Observation
+    ) -> None:
+        """Record whether this intent looks self-damaging, WITHOUT blocking it.
+
+        Runs the same color-space test ``GreedyPlanner`` uses to skip an unpaintable
+        region (``swatch_would_improve``), but only emits the finding. This is what makes
+        an unconstrained model planner measurable on a no-undo canvas: we learn how often
+        it commits a move that cannot be taken back and provably does not help, while its
+        choice still stands (a guard that silently corrected those moves would erase the
+        very measurement).
+
+        Planner-agnostic by construction — it reads only the intent and the observation,
+        so it works for any ``Planner``. Off unless an ``observer_palette`` was supplied.
+
+        Failures here are swallowed — an observer must never be able to kill a paint run —
+        but they are LOGGED rather than silently dropped. A silently-broken observer would
+        yield a run with zero flags, which is indistinguishable from a run where the
+        planner behaved perfectly; that would quietly invalidate the measurement this
+        whole mechanism exists to produce.
+        """
+        if self._observer_palette is None:
+            return
+        try:
+            improves = swatch_would_improve(
+                before, intent.box, self._observer_palette, intent.color
+            )
+            predicted = nearest_swatch(intent.color, self._observer_palette)
+            self._emit(ObserverFlag(
+                iteration=iteration,
+                cell=tuple(intent.cell),
+                requested_color=tuple(intent.color),
+                predicted_color=tuple(predicted),
+                self_damaging=not improves,
+            ))
+        except Exception:
+            log.warning(
+                "observer failed on iteration %d cell %s; the move proceeds unflagged",
+                iteration, tuple(intent.cell), exc_info=True,
+            )
 
     def _masked(self, before: Observation) -> Observation:
         """A copy of ``before`` with blacklisted cells' error zeroed, so the pure planner

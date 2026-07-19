@@ -58,6 +58,55 @@ class PaintIntent:
     size: float = 12.0
 
 
+def nearest_swatch(requested: Color, palette: Tuple[Color, ...]) -> Color:
+    """Nearest palette color to ``requested`` in Euclidean RGB — the same rule the easel
+    uses to realize a requested color, so a caller can predict the color that would truly
+    be painted."""
+    if not palette:
+        raise ValueError("palette must be non-empty")
+    r = np.array(requested, dtype=float)
+    return min(
+        palette,
+        key=lambda c: float(np.sum((np.array(c, dtype=float) - r) ** 2)),
+    )
+
+
+def swatch_would_improve(
+    observation: Observation,
+    box: Tuple[int, int, int, int],
+    palette: Tuple[Color, ...],
+    requested: Optional[Color] = None,
+) -> bool:
+    """True if painting ``box`` brings it closer, in perceptual color, than the canvas
+    already is.
+
+    Predicts the swatch the easel would actually pick for ``requested`` (defaulting to the
+    target's mean color in the box, which is what ``GreedyPlanner`` asks for), then
+    compares mean CIEDE2000-to-target for the current canvas against a uniform fill of
+    that swatch, using the same normalization as the error metric.
+
+    This is the no-undo self-damage test (Principle 7), shared by two callers with
+    different powers: ``GreedyPlanner`` uses it to *skip* a region, while the orchestrator's
+    observer uses it to *record* that a move looks self-damaging without blocking it.
+
+    Limits, stated honestly: it compares only the perceptual **color** term of the error
+    metric (a uniform swatch fill has no interior edges, and the metric's structural term
+    can't be predicted per-cell without border artifacts). So it identifies
+    color-unpaintable cells like a white gap exactly, but does NOT predict whether the
+    verifier will reject an edge-dominated region.
+    """
+    x0, y0, x1, y1 = box
+    target_patch = observation.target.image[y0:y1, x0:x1]
+    canvas_patch = observation.frame.image[y0:y1, x0:x1]
+    if requested is None:
+        requested = region_mean_color(observation.target.image, box)
+    swatch = nearest_swatch(requested, palette)
+    fill = np.full(target_patch.shape, swatch, dtype=np.uint8)
+    current = float(color_error(canvas_patch, target_patch).mean()) / DELTA_E_REF
+    predicted = float(color_error(fill, target_patch).mean()) / DELTA_E_REF
+    return predicted < current
+
+
 def region_mean_color(image: np.ndarray, box: Tuple[int, int, int, int]) -> Color:
     """Mean RGB of ``image`` inside ``box = (x0, y0, x1, y1)`` (half-open), rounded to
     an integer ``Color``. Used to read the target's color in a region straight from the
@@ -71,6 +120,31 @@ def region_mean_color(image: np.ndarray, box: Tuple[int, int, int, int]) -> Colo
     return (int(round(mean[0])), int(round(mean[1])), int(round(mean[2])))
 
 
+class PlannerSkip(Exception):
+    """The planner could not reach a decision this iteration. **Not** convergence.
+
+    ``plan`` has two distinct failure-to-return-an-intent modes that must never be
+    conflated, because they warrant opposite conclusions about the canvas:
+
+      * ``None`` — "I looked, and nothing is worth painting." An assertion about the
+        canvas: it has converged. ``GreedyPlanner`` can make this claim because it
+        measures every region against a threshold.
+      * ``PlannerSkip`` — "I failed to decide this turn." An assertion about the *planner*,
+        which says nothing at all about the canvas; the target may be barely started. A
+        model-backed planner raises this when the model returns nothing usable.
+
+    Overloading ``None`` for both is a live bug we hit: a VLM that failed on one iteration
+    ended the run labeled ``converged`` at ~13% global error with most cells unpainted.
+    So the signal travels through the ``Planner`` interface — an exception rather than a
+    second sentinel return, which keeps ``Optional[PaintIntent]`` honest, leaves every
+    existing planner's meaning untouched, and cannot be silently ignored by a caller.
+
+    The orchestrator's contract in return: a skip is a non-terminating no-op. It
+    re-observes and asks again, and terminates only on its real conditions — including a
+    dedicated cap on *consecutive* skips, which ends the run explicitly unconverged.
+    """
+
+
 class Planner(ABC):
     """The pluggable planner seat (Principle 6). Implementations decide the next paint
     action from a perceived ``Observation`` and nothing else."""
@@ -78,7 +152,11 @@ class Planner(ABC):
     @abstractmethod
     def plan(self, observation: Observation) -> Optional[PaintIntent]:
         """Return the next ``PaintIntent``, or ``None`` if the canvas has converged
-        (no region worth acting on)."""
+        (no region worth acting on).
+
+        Raise ``PlannerSkip`` instead of returning ``None`` if the decision could not be
+        made this iteration — ``None`` is a claim that the canvas is done, and a planner
+        that cannot decide is not entitled to make it."""
 
 
 class GreedyPlanner(Planner):
@@ -140,27 +218,14 @@ class GreedyPlanner(Planner):
         return None  # nothing above threshold is worth (or safe) painting
 
     def _swatch_improves(self, observation: Observation, box: Tuple[int, int, int, int]) -> bool:
-        """True if the swatch the easel would actually pick brings this region closer, in
-        perceptual color, than the canvas already is. Mirrors the easel's Euclidean-RGB
-        nearest-swatch selection so the predicted color is the one that would really land,
-        then compares mean CIEDE2000-to-target for the current canvas vs a uniform swatch
-        fill (same normalization as the error metric)."""
-        x0, y0, x1, y1 = box
-        target_patch = observation.target.image[y0:y1, x0:x1]
-        canvas_patch = observation.frame.image[y0:y1, x0:x1]
-        requested = region_mean_color(observation.target.image, box)
-        swatch = self._nearest_swatch(requested)
-        fill = np.full(target_patch.shape, swatch, dtype=np.uint8)
-        current = float(color_error(canvas_patch, target_patch).mean()) / DELTA_E_REF
-        predicted = float(color_error(fill, target_patch).mean()) / DELTA_E_REF
-        return predicted < current
+        """This planner's view of the shared self-damage test — see
+        ``swatch_would_improve``, which the orchestrator's non-blocking observer also
+        uses so both read the same rule."""
+        return swatch_would_improve(
+            observation, box, self.palette  # type: ignore[arg-type]  # guarded by caller
+        )
 
     def _nearest_swatch(self, requested: Color) -> Color:
-        """Nearest palette color to ``requested`` in Euclidean RGB — the same rule the
-        easel uses to realize a requested color, so the guard predicts the color that
-        would truly be painted."""
-        r = np.array(requested, dtype=float)
-        return min(
-            self.palette,  # type: ignore[arg-type]  # guarded by caller (palette set)
-            key=lambda c: float(np.sum((np.array(c, dtype=float) - r) ** 2)),
-        )
+        """This planner's view of the shared nearest-swatch rule (see
+        ``nearest_swatch``)."""
+        return nearest_swatch(requested, self.palette)  # type: ignore[arg-type]

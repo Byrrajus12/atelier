@@ -36,6 +36,7 @@ REASON_BUDGET = "budget"            # hit the max-iterations safety cap
 REASON_STALLED = "stalled"          # only over-threshold regions left are blacklisted
 REASON_STALLED_NO_PROGRESS = "stalled_no_progress"  # global error flat for N iterations
 REASON_CANVAS_LOST = "canvas_lost"  # capture/stroke kept failing to locate the canvas
+REASON_PLANNER_SKIPPED = "planner_skipped"  # planner failed to decide N times running
 
 STATUS_RUNNING = "running"
 STATUS_DONE = "done"
@@ -106,6 +107,50 @@ class PlanDone(Event):
     type: ClassVar[str] = "plan.done"
     iteration: int
     intent: PaintIntent
+
+
+@dataclass(frozen=True)
+class PlannerSkipped(Event):
+    """The planner raised ``PlannerSkip`` — it could not decide this iteration, so no
+    paint happened and the loop re-observed and moved on.
+
+    Emitted so a skip is visible rather than a silent gap in the stream: a run that ends
+    on consecutive skips should be readable as "the planner kept failing", not as an
+    unexplained early stop. ``iteration`` is the count of paint intents completed so far,
+    which a skip does NOT advance — so repeated skips share one number, and
+    ``consecutive`` is what distinguishes them and shows how close the run is to the
+    skip cap.
+    """
+
+    type: ClassVar[str] = "planner.skipped"
+    iteration: int
+    consecutive: int
+
+
+@dataclass(frozen=True)
+class ObserverFlag(Event):
+    """A NON-BLOCKING judgment of the intent just planned: would painting this cell with
+    this color actually reduce its region error, or would it damage a canvas that cannot
+    be undone?
+
+    Purely observational. The planner's choice always stands — this event exists so a run
+    can be measured (how often does an unconstrained model planner make irreversibly-bad
+    moves?) without a guard silently correcting the behavior being measured. Emitted only
+    when the orchestrator is given an ``observer_palette``.
+
+    self_damaging:   True if no improvement is predicted for this cell — the region is
+                     already closer to the target than the swatch that would land.
+    predicted_color: the swatch the easel would actually realize for the requested color
+                     (the intent asks for a color; the environment snaps it to a palette),
+                     so a consumer can see what would truly be painted.
+    """
+
+    type: ClassVar[str] = "observer.flag"
+    iteration: int
+    cell: Tuple[int, int]
+    requested_color: Tuple[int, int, int]
+    predicted_color: Tuple[int, int, int]
+    self_damaging: bool
 
 
 @dataclass(frozen=True)
