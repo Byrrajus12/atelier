@@ -24,27 +24,36 @@ from planners.vision_prompt import (
     TOOL_NAME,
     build_request,
     draw_grid,
+    _axis_margin,
     extract_reasoning,
     parse_tool_call,
     prepare_image,
 )
-from planners.vlm_planner import VLMPlanner
+from planners.vlm_planner import MAX_ATTEMPTS, VLMPlanner
 
 
 def solid(h, w, rgb):
     return np.full((h, w, 3), rgb, dtype=np.uint8)
 
 
-def make_observation(n=4, h=40, w=40, region_error=None):
-    """A fabricated Observation, mirroring tests/test_planner.py's helper. The canvas is
-    white and the target has a red patch in cell (1, 2), so color reads are checkable."""
+def make_observation(
+    n=4,
+    h=40,
+    w=40,
+    region_error=None,
+    target_cell=(1, 2),
+    target_color=(255, 0, 0),
+    canvas_color=(255, 255, 255),
+):
+    """A fabricated Observation, mirroring tests/test_planner.py's helper."""
     canvas = solid(h, w, (255, 255, 255))
     target = solid(h, w, (255, 255, 255))
-    x0, y0, x1, y1 = cell_box(1, 2, n, (w, h))
-    target[y0:y1, x0:x1] = (255, 0, 0)
+    x0, y0, x1, y1 = cell_box(target_cell[0], target_cell[1], n, (w, h))
+    canvas[y0:y1, x0:x1] = canvas_color
+    target[y0:y1, x0:x1] = target_color
     grid = region_error if region_error is not None else np.zeros((n, n))
     if region_error is None:
-        grid[1, 2] = 0.8
+        grid[target_cell] = 0.8
     return Observation(
         frame=Frame(canvas),
         target=Target(target),
@@ -128,6 +137,8 @@ def test_vlm_planner_rejects_bad_params():
         VLMPlanner(FakeFireworksClient([]), image_size=0)
     with pytest.raises(ValueError):
         VLMPlanner(FakeFireworksClient([]), max_tokens=0)
+    with pytest.raises(ValueError):
+        VLMPlanner(FakeFireworksClient([]), palette=())
 
 
 # --- happy path: grounding a chosen cell into a PaintIntent ------------------------
@@ -147,7 +158,8 @@ def test_plan_grounds_the_cell_to_the_matching_box():
     wrong place (or transposed)."""
     n, h, w = 4, 40, 40
     obs = make_observation(n=n, h=h, w=w)
-    client = FakeFireworksClient([tool_response((0, 3), (10, 20, 30))])
+    obs = make_observation(n=n, h=h, w=w, target_cell=(0, 3), target_color=(255, 0, 0))
+    client = FakeFireworksClient([tool_response((0, 3), (255, 0, 0))])
     intent = VLMPlanner(client).plan(obs)
     assert intent.box == cell_box(0, 3, n, (w, h))
 
@@ -171,7 +183,9 @@ def test_plan_uses_grid_n_from_the_observation():
     n = 6
     grid = np.zeros((n, n))
     grid[5, 5] = 0.5
-    obs = make_observation(n=n, h=60, w=60, region_error=grid)
+    obs = make_observation(
+        n=n, h=60, w=60, region_error=grid, target_cell=(5, 5), target_color=(0, 0, 255)
+    )
     client = FakeFireworksClient([tool_response((5, 5), (0, 0, 255))])
     intent = VLMPlanner(client).plan(obs)
     assert intent.cell == (5, 5)  # would be out of range for the n=4 default
@@ -193,11 +207,11 @@ def test_plan_rejects_false_done_as_planner_skip():
     grid = np.zeros((4, 4))
     grid[1, 2] = 0.8
     obs = make_observation(n=4, region_error=grid)
-    client = FakeFireworksClient([done_response(), done_response()])
+    client = FakeFireworksClient([done_response()] * MAX_ATTEMPTS)
 
     with pytest.raises(PlannerSkip):
         VLMPlanner(client).plan(obs)
-    assert client.call_count == 2
+    assert client.call_count == MAX_ATTEMPTS
 
 
 def test_malformed_done_response_retries_and_can_recover():
@@ -282,6 +296,7 @@ def test_request_defaults_match_the_probe_validated_values():
     # canvas the model's pre-call reasoning runs long enough that 500 truncated the call
     # away in a live run (finish_reason=length, no tool_calls).
     assert body["max_tokens"] >= 1500
+    assert body["temperature"] == 0
     assert body["model"] == "m"
 
 
@@ -299,6 +314,24 @@ def test_draw_grid_does_not_mutate_its_input():
     before = img.copy()
     draw_grid(img, 6)
     assert np.array_equal(img, before)
+
+
+def test_axis_labels_do_not_contaminate_cell_interiors():
+    n = 6
+    size = 128
+    img = solid(300, 300, (17, 17, 17))
+    out = prepare_image(img, n, size=size)
+    margin = _axis_margin(size)
+    edges = margin + np.linspace(0, size - margin, n + 1).astype(int)
+
+    # Axis labels should mark the white header strips, but never the cell interiors.
+    assert not np.all(out[:margin, :] == 255)
+    assert not np.all(out[:, :margin] == 255)
+    for i in range(n):
+        for j in range(n):
+            cy = int((edges[i] + edges[i + 1]) // 2)
+            cx = int((edges[j] + edges[j + 1]) // 2)
+            assert np.array_equal(out[cy, cx], np.array([17, 17, 17], dtype=np.uint8))
 
 
 def test_planner_passes_its_image_size_through_to_the_request():
@@ -391,41 +424,39 @@ def test_parse_rejects_bad_argument_shapes(args):
         parse_tool_call(resp, 4)
 
 
-# --- error handling: retry once, then skip -----------------------------------------
+# --- error handling: bounded retries, then skip ------------------------------------
 # A failure to decide raises PlannerSkip, NEVER returns None. None means "the canvas has
 # converged", which a model that did not answer is in no position to claim — the live bug
 # this guards ended a run reported converged=True at ~13% error with the canvas mostly
 # blank. See core.planner.PlannerSkip.
-def test_network_error_retries_once_then_skips():
+def test_network_error_retries_then_skips():
     obs = make_observation()
     client = FakeFireworksClient([
-        FireworksError("connection reset"),
-        FireworksError("connection reset again"),
+        *[FireworksError("connection reset") for _ in range(MAX_ATTEMPTS)],
     ])
     with pytest.raises(PlannerSkip):
         VLMPlanner(client).plan(obs)
-    assert client.call_count == 2  # exactly one retry, no infinite hammering
+    assert client.call_count == MAX_ATTEMPTS  # bounded retry, no infinite hammering
 
 
-def test_malformed_response_retries_once_then_skips():
+def test_malformed_response_retries_then_skips():
     obs = make_observation()
     bad = {"choices": [{"message": {"content": "I think cell 1,2 looks wrong."},
                         "finish_reason": "length"}]}
-    client = FakeFireworksClient([bad, bad])
+    client = FakeFireworksClient([bad] * MAX_ATTEMPTS)
     with pytest.raises(PlannerSkip):
         VLMPlanner(client).plan(obs)
-    assert client.call_count == 2
+    assert client.call_count == MAX_ATTEMPTS
 
 
-def test_out_of_range_cell_retries_once_then_skips():
+def test_out_of_range_cell_retries_then_skips():
     obs = make_observation(n=4)
     client = FakeFireworksClient([
-        tool_response((9, 9), (255, 0, 0)),
-        tool_response((9, 9), (255, 0, 0)),
+        *[tool_response((9, 9), (255, 0, 0)) for _ in range(MAX_ATTEMPTS)],
     ])
     with pytest.raises(PlannerSkip):
         VLMPlanner(client).plan(obs)
-    assert client.call_count == 2
+    assert client.call_count == MAX_ATTEMPTS
 
 
 def test_a_failure_to_decide_is_never_reported_as_convergence():
@@ -437,7 +468,7 @@ def test_a_failure_to_decide_is_never_reported_as_convergence():
                     {"choices": [{"message": {"content": "prose"},
                                   "finish_reason": "length"}]},
                     {"unexpected": "shape"}):
-        planner = VLMPlanner(FakeFireworksClient([failure, failure]))
+        planner = VLMPlanner(FakeFireworksClient([failure] * MAX_ATTEMPTS))
         with pytest.raises(PlannerSkip):
             planner.plan(obs)
 
@@ -458,14 +489,35 @@ def test_a_retry_that_succeeds_yields_a_valid_intent():
     assert client.call_count == 2
 
 
+def test_rejected_paint_decision_gets_feedback_and_retries():
+    obs = make_observation()
+    client = FakeFireworksClient([
+        tool_response((0, 0), (255, 0, 0), reasoning_content="wrong finished cell"),
+        tool_response((1, 2), (255, 0, 0), reasoning_content="corrected"),
+    ])
+    planner = VLMPlanner(client)
+
+    intent = planner.plan(obs)
+
+    assert intent is not None
+    assert intent.cell == (1, 2)
+    assert client.call_count == 2
+    assert len(client.requests[0]["messages"]) == 1
+    assert len(client.requests[1]["messages"]) == 3
+    assert client.requests[1]["messages"][1]["tool_calls"][0]["function"]["name"] == TOOL_NAME
+    feedback = client.requests[1]["messages"][2]["content"]
+    assert "That move was rejected" in feedback
+    assert "already converged" in feedback
+    assert "Do not repeat rejected moves" in feedback
+
+
 def test_skip_clears_stale_reasoning():
     """A skipped iteration must not leave the previous decision's reasoning behind, or a
     later consumer would attribute it to the wrong (non-)decision."""
     obs = make_observation()
     client = FakeFireworksClient([
         tool_response((1, 2), (255, 0, 0), reasoning_content="first"),
-        FireworksError("down"),
-        FireworksError("still down"),
+        *[FireworksError("down") for _ in range(MAX_ATTEMPTS)],
     ])
     planner = VLMPlanner(client)
     planner.plan(obs)
@@ -482,7 +534,7 @@ def test_a_hostile_response_produces_a_skip_and_nothing_worse():
     for junk in ({"choices": [{"message": {"tool_calls": [{"function": {}}]}}]},
                  {"choices": [{"message": {"tool_calls": [{}]}}]},
                  {"unexpected": "shape"}):
-        client = FakeFireworksClient([junk, junk])
+        client = FakeFireworksClient([junk] * MAX_ATTEMPTS)
         with pytest.raises(PlannerSkip):
             VLMPlanner(client).plan(obs)
 

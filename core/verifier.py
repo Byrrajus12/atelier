@@ -35,7 +35,7 @@ from typing import Tuple
 from core.perception import Observation
 from core.planner import PaintIntent
 
-# Provisional, like the planner's DEFAULT_ERROR_THRESHOLD (0.02): region error is
+# Provisional, like the planner's seam-tolerant DEFAULT_ERROR_THRESHOLD (0.08): region error is
 # mean-per-pixel in [0, 1], so this is the smallest drop that reads as a real
 # improvement rather than capture / anti-aliasing noise. Tunable via the constructor.
 DEFAULT_IMPROVEMENT_THRESHOLD = 0.005

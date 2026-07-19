@@ -61,7 +61,7 @@ from planners.vlm_planner import DEFAULT_MODEL, VLMPlanner  # noqa: E402
 #     bled into is picked and "painted toward white" -> red, and the colored block then
 #     grows across any white gap until it collides with another block (the border war).
 #   * The cure used here is a COARSE grid: at grid_n=6 a cell is 100px, so the executor's
-#     ~6px bleed is only ~6% of a rim cell — below the planner's 0.02 error threshold — so
+#     ~6px bleed is only ~6% of a rim cell — below the planner's 0.08 error threshold — so
 #     bled white rim cells stay unpicked and blocks do NOT grow. Blocks are grid-aligned
 #     (whole cells), well separated by white, and no two differently-colored blocks are
 #     adjacent, so the only interactions are same-color (cooperative) fills.

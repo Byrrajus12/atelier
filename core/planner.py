@@ -27,7 +27,10 @@ import numpy as np
 from core.adapter import Color
 from core.perception import Observation, cell_box, color_error, DELTA_E_REF
 
-DEFAULT_ERROR_THRESHOLD = 0.02  # provisional; region error is mean-per-pixel in [0,1]
+# Brush strokes leave thin seam artifacts at cell boundaries with residual region error
+# around 0.05-0.07. Genuinely wrong cells are much higher (0.3+), so the threshold must sit
+# between seam noise and real mistakes.
+DEFAULT_ERROR_THRESHOLD = 0.08
 
 
 @dataclass

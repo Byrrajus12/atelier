@@ -136,7 +136,7 @@ def test_greedy_end_to_end_on_real_observation():
 
 # --- convergence -----------------------------------------------------------------
 def test_greedy_returns_none_when_converged():
-    grid = np.full((4, 4), 0.01)  # everything below the default 0.02 threshold
+    grid = np.full((4, 4), 0.01)  # everything below the default 0.08 threshold
     obs = make_observation(solid(40, 40, (0, 0, 0)), solid(40, 40, (0, 0, 0)), grid)
     assert GreedyPlanner().plan(obs) is None
 
