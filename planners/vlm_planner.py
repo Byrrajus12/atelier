@@ -25,24 +25,26 @@ The orchestrator treats that as a no-op: it re-observes and asks again next iter
 ends the run only if the skips keep coming. A flaky API degrades the run's pace, never its
 correctness, and never crashes it.
 
-Note what this planner never does: **return ``None``**. ``None`` is a claim that the canvas
-has converged, and this planner is in no position to make it — a vision model that failed to
-answer knows nothing about how finished the painting is. Conflating the two is a bug we
-actually shipped: one failed iteration ended a run reported as ``converged`` at ~13% global
-error with most cells still blank. Every non-decision here is a skip.
+The planner may return ``None`` only when the model explicitly reports completion and
+the observation's own region-error grid confirms every cell is within the same
+threshold used by ``GreedyPlanner``. A model that reports completion too early is
+treated like any other unusable decision: retry once, then ``PlannerSkip``. The model
+proposes "done"; the metric decides whether that claim is honest.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple
+from typing import Optional
 
 from core.perception import Observation, cell_box
-from core.planner import PaintIntent, Planner, PlannerSkip
+from core.planner import DEFAULT_ERROR_THRESHOLD, PaintIntent, Planner, PlannerSkip
 from planners.fireworks_client import FireworksClient, FireworksError
 from planners.vision_prompt import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_PROBE_SIZE,
+    DoneDecision,
+    PaintDecision,
     build_request,
     parse_tool_call,
 )
@@ -53,8 +55,8 @@ log = logging.getLogger(__name__)
 
 
 class VLMPlanner(Planner):
-    """Plans one paint action per call by asking a vision model to pick a grid cell and a
-    color.
+    """Plans one paint action or verified completion by asking a vision model to choose
+    between painting one grid cell and reporting the canvas complete.
 
     The ``client`` is injected so tests run against a fake and never touch the network.
     ``image_size`` defaults to the value the STEP 0 probe validated against the live API
@@ -86,10 +88,11 @@ class VLMPlanner(Planner):
         self.last_reasoning: Optional[str] = None
 
     def plan(self, observation: Observation) -> Optional[PaintIntent]:
-        """Ask the model for the next cell + color and return it as a ``PaintIntent``.
+        """Ask the model for the next decision.
 
-        Raises ``PlannerSkip`` if two consecutive attempts failed to produce a usable
-        answer. Never returns ``None`` — see the module docstring."""
+        Returns a ``PaintIntent`` for a paint decision, ``None`` for metric-confirmed
+        completion, and raises ``PlannerSkip`` if two consecutive attempts failed to
+        produce a usable answer."""
         n = int(observation.region_error.shape[0])
         body = build_request(
             self.model,
@@ -112,7 +115,7 @@ class VLMPlanner(Planner):
             log.debug("VLM raw response (attempt %d/2): %s", attempt, response)
 
             try:
-                cell, color, reasoning = parse_tool_call(response, n)
+                decision = parse_tool_call(response, n)
             except ValueError as ex:
                 log.warning(
                     "VLM response unusable (attempt %d/2): %s -- raw response: %s",
@@ -120,17 +123,39 @@ class VLMPlanner(Planner):
                 )
                 continue
 
-            self.last_reasoning = reasoning
-            i, j = cell
+            self.last_reasoning = decision.reasoning
+            if isinstance(decision, DoneDecision):
+                max_error = float(observation.region_error.max())
+                if max_error <= DEFAULT_ERROR_THRESHOLD:
+                    log.info(
+                        "VLM reported canvas complete; metric confirmed max region "
+                        "error %.4f <= %.4f: %s",
+                        max_error, DEFAULT_ERROR_THRESHOLD,
+                        decision.reasoning[:200] or "(none given)",
+                    )
+                    return None
+                log.warning(
+                    "VLM reported canvas complete but metric rejected it: max region "
+                    "error %.4f > %.4f",
+                    max_error, DEFAULT_ERROR_THRESHOLD,
+                )
+                continue
+
+            if not isinstance(decision, PaintDecision):
+                log.warning("VLM response produced unknown decision type %r", decision)
+                continue
+
+            i, j = decision.cell
             intent = PaintIntent(
                 cell=(i, j),
                 box=cell_box(i, j, n, observation.frame.size),
-                color=color,
+                color=decision.color,
                 error=float(observation.region_error[i, j]),
             )
             log.info(
                 "VLM chose cell %s color %s (region error %.4f): %s",
-                intent.cell, intent.color, intent.error, reasoning[:200] or "(none given)",
+                intent.cell, intent.color, intent.error,
+                decision.reasoning[:200] or "(none given)",
             )
             return intent
 

@@ -11,10 +11,12 @@ What the probe established, and why each piece is here:
   * **Grid-labeled images.** Grid lines plus an ``i,j`` label at each cell center let the
     model ground a cell index visually instead of inferring pixel math from a text
     description. Validated legible at 128x128.
-  * **Forced tool call.** ``tool_choice`` pinned to the specific ``propose_paint_cell``
-    function. Left to its own devices the model narrated prose and never called the tool.
-  * **Reasoning budget.** The model spends its reasoning *before* emitting the call, so
-    the completion budget must clear that or the call is truncated away
+  * **Required tool call.** ``tool_choice`` requires a tool call while offering either
+    ``propose_paint_cell`` or ``report_canvas_complete``. Left to its own devices the
+    model narrated prose and never called the tool; forcing the specific paint function
+    worked for Phase 1 but gave the model no honest way to say the canvas was done.
+  * **Reasoning budget.** The model spends its reasoning *before* emitting the tool
+    call, so the completion budget must clear that or the call is truncated away
     (``finish_reason=length``). How much it spends depends on the canvas: a blank one is
     an easy call, a half-painted one invites a long cell-by-cell comparison. Two levers
     keep the call inside the budget — a budget sized for the mid-run case
@@ -29,7 +31,8 @@ What the probe established, and why each piece is here:
 from __future__ import annotations
 
 import base64
-from typing import Any, Dict, List, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple, Union
 
 import cv2
 import numpy as np
@@ -42,15 +45,21 @@ DEFAULT_PROBE_SIZE = 128  # downsampled square edge length; validated legible by
 DEFAULT_MAX_TOKENS = 1500
 
 TOOL_NAME = "propose_paint_cell"
+DONE_TOOL_NAME = "report_canvas_complete"
 
-# Pinned to the specific function. "auto" (and an unforced tool list) let the model
-# answer in prose instead; the specific form is what the probe confirmed fires.
+# Require some tool call. The model may choose between proposing paint and reporting
+# completion, but it still cannot satisfy the request with prose alone.
+TOOL_CHOICE_REQUIRED = "required"
+
+# Pinned to the specific function. Kept for probes/tests that intentionally exercise the
+# original single-function shape; the planner now defaults to TOOL_CHOICE_REQUIRED so the
+# model can also report completion.
 TOOL_CHOICE_SPECIFIC: Dict[str, Any] = {
     "type": "function",
     "function": {"name": TOOL_NAME},
 }
 
-TOOL_SCHEMA: Dict[str, Any] = {
+PAINT_TOOL_SCHEMA: Dict[str, Any] = {
     "type": "function",
     "function": {
         "name": TOOL_NAME,
@@ -87,6 +96,41 @@ TOOL_SCHEMA: Dict[str, Any] = {
         },
     },
 }
+
+DONE_TOOL_SCHEMA: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": DONE_TOOL_NAME,
+        "description": (
+            "Report that the current canvas already matches the target well enough and "
+            "no paint action should be taken."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reasoning": {
+                    "type": "string",
+                    "description": "Why the canvas appears complete.",
+                },
+            },
+        },
+    },
+}
+
+
+@dataclass(frozen=True)
+class PaintDecision:
+    cell: Tuple[int, int]
+    color: Tuple[int, int, int]
+    reasoning: str
+
+
+@dataclass(frozen=True)
+class DoneDecision:
+    reasoning: str
+
+
+ToolDecision = Union[PaintDecision, DoneDecision]
 
 
 def draw_grid(img: np.ndarray, n: int) -> np.ndarray:
@@ -140,14 +184,18 @@ def build_prompt(n: int) -> str:
         f"the CURRENT CANVAS (what it looks like now). Grid cells are labeled 'i,j' at "
         f"their centers: i is the row (0 at top), j is the column (0 at left). Both "
         f"images use the same grid.\n\n"
-        f"Pick exactly ONE cell where the current canvas differs most from the target, "
-        f"and the RGB color that would make that cell match the target. Call "
-        f"{TOOL_NAME} with your choice.\n\n"
-        f"Decide quickly. Scan for the single most obviously wrong cell and call the "
-        f"function as soon as you have it. Do NOT audit the grid cell by cell, do not "
-        f"list or compare every cell's state, and do not rank candidates — one clear "
-        f"mismatch is enough. Keep your reasoning to one or two sentences. The output "
-        f"you owe is a decision, not a survey of the canvas."
+        f"If the current canvas already matches the target, call {DONE_TOOL_NAME}. Do "
+        f"not keep searching a matching canvas for tiny or imagined differences.\n\n"
+        f"If there is a clear mismatch, pick exactly ONE cell where the current canvas "
+        f"differs most from the target, and the RGB color that would make that cell "
+        f"match the target. Call {TOOL_NAME} with your choice.\n\n"
+        f"Decide quickly. First decide whether the canvas is already complete. If it "
+        f"is, report complete promptly. Otherwise scan for the single most obviously "
+        f"wrong cell and call the paint function as soon as you have it. Do NOT audit "
+        f"the grid cell by cell, do not list or compare every cell's state, and do not "
+        f"rank candidates — one clear mismatch is enough. Keep your reasoning to one "
+        f"or two sentences. The output you owe is a tool call, not a survey of the "
+        f"canvas."
     )
 
 
@@ -190,8 +238,8 @@ def build_request(
         "model": model,
         "max_tokens": max_tokens,
         "messages": build_messages(target_uri, canvas_uri, n),
-        "tools": [TOOL_SCHEMA],
-        "tool_choice": TOOL_CHOICE_SPECIFIC if tool_choice is None else tool_choice,
+        "tools": [PAINT_TOOL_SCHEMA, DONE_TOOL_SCHEMA],
+        "tool_choice": TOOL_CHOICE_REQUIRED if tool_choice is None else tool_choice,
     }
 
 
@@ -214,15 +262,13 @@ def extract_reasoning(message: Dict[str, Any], tool_args: Dict[str, Any]) -> str
     return ""
 
 
-def parse_tool_call(
-    response: Dict[str, Any], n: int
-) -> Tuple[Tuple[int, int], Tuple[int, int, int], str]:
-    """Extract ``(cell, color, reasoning)`` from a chat-completions response.
+def parse_tool_call(response: Dict[str, Any], n: int) -> ToolDecision:
+    """Extract a typed tool decision from a chat-completions response.
 
-    Raises ``ValueError`` for anything unusable — no tool call, malformed JSON arguments,
-    wrong arity, a cell outside the ``n x n`` grid, or a channel outside 0..255. The
-    caller (the planner) turns that into a retry and ultimately a skipped iteration; a
-    bad response must never crash a paint run.
+    Raises ``ValueError`` for anything unusable — no tool call, unknown function,
+    malformed JSON arguments, wrong arity, a cell outside the ``n x n`` grid, or a
+    channel outside 0..255. The caller (the planner) turns that into a retry and
+    ultimately a skipped iteration; a bad response must never crash a paint run.
     """
     import json
 
@@ -239,9 +285,16 @@ def parse_tool_call(
             f"no tool_calls in response (finish_reason={finish!r}); the model did not "
             f"emit structured output"
         )
+    if len(tool_calls) != 1:
+        raise ValueError(
+            f"expected exactly one tool_call, got {len(tool_calls)}; paint and done "
+            f"decisions must not be combined"
+        )
 
     try:
-        raw_args = tool_calls[0]["function"]["arguments"]
+        function = tool_calls[0]["function"]
+        name = function["name"]
+        raw_args = function.get("arguments", "{}")
     except (KeyError, IndexError, TypeError) as ex:
         raise ValueError(f"malformed tool_call structure: {ex}") from ex
 
@@ -259,6 +312,12 @@ def parse_tool_call(
     if not isinstance(args, dict):
         raise ValueError(f"tool_call arguments must be an object, got {type(args)}")
 
+    if name == DONE_TOOL_NAME:
+        return DoneDecision(reasoning=extract_reasoning(message, args))
+
+    if name != TOOL_NAME:
+        raise ValueError(f"unexpected tool call {name!r}")
+
     cell = _as_int_tuple(args.get("cell"), 2, "cell")
     color = _as_int_tuple(args.get("color"), 3, "color")
 
@@ -268,7 +327,11 @@ def parse_tool_call(
     if not all(0 <= c <= 255 for c in color):
         raise ValueError(f"color {color} has a channel outside 0..255")
 
-    return cell, (color[0], color[1], color[2]), extract_reasoning(message, args)
+    return PaintDecision(
+        cell=(cell[0], cell[1]),
+        color=(color[0], color[1], color[2]),
+        reasoning=extract_reasoning(message, args),
+    )
 
 
 def _as_int_tuple(value: Any, arity: int, name: str) -> Tuple[int, ...]:

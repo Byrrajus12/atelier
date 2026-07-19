@@ -17,7 +17,10 @@ from planners.fireworks_client import (
     HTTPFireworksClient,
 )
 from planners.vision_prompt import (
-    TOOL_CHOICE_SPECIFIC,
+    DONE_TOOL_NAME,
+    DoneDecision,
+    PaintDecision,
+    TOOL_CHOICE_REQUIRED,
     TOOL_NAME,
     build_request,
     draw_grid,
@@ -64,6 +67,26 @@ def tool_response(cell, color, reasoning_content=None, tool_reasoning=""):
                     "arguments": json.dumps(
                         {"cell": list(cell), "color": list(color), "reasoning": tool_reasoning}
                     ),
+                },
+            }
+        ],
+    }
+    if reasoning_content is not None:
+        message["reasoning_content"] = reasoning_content
+    return {"choices": [{"message": message, "finish_reason": "tool_calls"}]}
+
+
+def done_response(reasoning_content=None, tool_reasoning=""):
+    """A well-formed chat-completions response carrying report_canvas_complete."""
+    message = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "type": "function",
+                "function": {
+                    "name": DONE_TOOL_NAME,
+                    "arguments": json.dumps({"reasoning": tool_reasoning}),
                 },
             }
         ],
@@ -155,6 +178,41 @@ def test_plan_uses_grid_n_from_the_observation():
     assert intent.box == cell_box(5, 5, n, (60, 60))
 
 
+def test_plan_returns_none_when_done_is_metric_confirmed():
+    grid = np.full((4, 4), 0.01)
+    obs = make_observation(n=4, region_error=grid)
+    client = FakeFireworksClient([done_response(reasoning_content="everything matches")])
+    planner = VLMPlanner(client)
+
+    assert planner.plan(obs) is None
+    assert planner.last_reasoning == "everything matches"
+    assert client.call_count == 1
+
+
+def test_plan_rejects_false_done_as_planner_skip():
+    grid = np.zeros((4, 4))
+    grid[1, 2] = 0.8
+    obs = make_observation(n=4, region_error=grid)
+    client = FakeFireworksClient([done_response(), done_response()])
+
+    with pytest.raises(PlannerSkip):
+        VLMPlanner(client).plan(obs)
+    assert client.call_count == 2
+
+
+def test_malformed_done_response_retries_and_can_recover():
+    grid = np.full((4, 4), 0.01)
+    obs = make_observation(n=4, region_error=grid)
+    bad = done_response()
+    bad["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = "{not json"
+    client = FakeFireworksClient([bad, done_response(reasoning_content="retry complete")])
+    planner = VLMPlanner(client)
+
+    assert planner.plan(obs) is None
+    assert planner.last_reasoning == "retry complete"
+    assert client.call_count == 2
+
+
 # --- reasoning capture -------------------------------------------------------------
 def test_reasoning_content_is_captured_as_the_primary_source():
     """The probed model puts chain-of-thought in reasoning_content and leaves the schema's
@@ -198,12 +256,13 @@ def test_missing_reasoning_does_not_block_a_valid_decision():
 
 
 # --- request construction ----------------------------------------------------------
-def test_request_forces_the_specific_tool_call():
-    """Unforced, the probed model narrated prose and never called the tool. The specific
-    form is what made structured output fire."""
+def test_request_requires_a_tool_call_and_offers_paint_or_done():
+    """The model must call a tool, but may choose paint or verified completion."""
     body = build_request("m", solid(40, 40, (255, 255, 255)), solid(40, 40, (0, 0, 0)), 4)
-    assert body["tool_choice"] == TOOL_CHOICE_SPECIFIC
-    assert body["tools"][0]["function"]["name"] == TOOL_NAME
+    assert body["tool_choice"] == TOOL_CHOICE_REQUIRED
+    assert {tool["function"]["name"] for tool in body["tools"]} == {
+        TOOL_NAME, DONE_TOOL_NAME,
+    }
 
 
 def test_request_carries_both_images_and_the_grid_size():
@@ -252,11 +311,27 @@ def test_planner_passes_its_image_size_through_to_the_request():
 
 
 # --- parsing: every rejection path -------------------------------------------------
-def test_parse_accepts_a_well_formed_call():
-    cell, color, reasoning = parse_tool_call(tool_response((1, 2), (255, 0, 0)), 4)
-    assert cell == (1, 2)
-    assert color == (255, 0, 0)
-    assert reasoning == ""
+def test_parse_accepts_a_well_formed_paint_call():
+    decision = parse_tool_call(tool_response((1, 2), (255, 0, 0)), 4)
+    assert isinstance(decision, PaintDecision)
+    assert decision.cell == (1, 2)
+    assert decision.color == (255, 0, 0)
+    assert decision.reasoning == ""
+
+
+def test_parse_accepts_a_well_formed_done_call():
+    decision = parse_tool_call(done_response(reasoning_content="looks finished"), 4)
+    assert isinstance(decision, DoneDecision)
+    assert decision.reasoning == "looks finished"
+
+
+def test_parse_rejects_ambiguous_multiple_tool_calls():
+    resp = done_response(reasoning_content="finished")
+    resp["choices"][0]["message"]["tool_calls"].append(
+        tool_response((1, 2), (255, 0, 0))["choices"][0]["message"]["tool_calls"][0]
+    )
+    with pytest.raises(ValueError, match="exactly one tool_call"):
+        parse_tool_call(resp, 4)
 
 
 def test_parse_accepts_dict_arguments_as_well_as_a_json_string():
@@ -264,7 +339,9 @@ def test_parse_accepts_dict_arguments_as_well_as_a_json_string():
     resp["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = {
         "cell": [1, 2], "color": [255, 0, 0]
     }
-    assert parse_tool_call(resp, 4)[0] == (1, 2)
+    decision = parse_tool_call(resp, 4)
+    assert isinstance(decision, PaintDecision)
+    assert decision.cell == (1, 2)
 
 
 @pytest.mark.parametrize("bad_response", [
