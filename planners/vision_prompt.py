@@ -8,9 +8,10 @@ the model ignores).
 
 What the probe established, and why each piece is here:
 
-  * **Grid-labeled images.** Grid lines plus an ``i,j`` label at each cell center let the
-    model ground a cell index visually instead of inferring pixel math from a text
-    description. Validated legible at 128x128.
+  * **Axis-labeled images.** Grid lines plus spreadsheet-style row/column headers let
+    the model ground a cell index visually without drawing annotation pixels inside the
+    cells whose colors it must judge. In-cell labels caused a systematic row association
+    error, and colored label halos looked like paint defects to the model.
   * **Required tool call.** ``tool_choice`` requires a tool call while offering either
     ``propose_paint_cell`` or ``report_canvas_complete``. Left to its own devices the
     model narrated prose and never called the tool; forcing the specific paint function
@@ -133,36 +134,69 @@ class DoneDecision:
 ToolDecision = Union[PaintDecision, DoneDecision]
 
 
-def draw_grid(img: np.ndarray, n: int) -> np.ndarray:
-    """Overlay grid lines + ``i,j`` labels at each cell center on a COPY of ``img``.
+def _axis_margin(size: int) -> int:
+    """Header-strip thickness for row/column labels in a final model image."""
+    return min(max(12, int(round(size * 0.14))), max(1, size // 4))
 
-    Labels are drawn with a black outline under white fill so they stay readable over any
-    cell color (including the near-black swatch)."""
+
+def _put_centered_text(
+    img: np.ndarray,
+    text: str,
+    center: Tuple[int, int],
+    font: int,
+    font_scale: float,
+    color: Tuple[int, int, int],
+) -> None:
+    (text_w, text_h), _ = cv2.getTextSize(text, font, font_scale, 1)
+    cx, cy = center
+    origin = (int(cx - text_w / 2), int(cy + text_h / 2))
+    cv2.putText(img, text, origin, font, font_scale, color, 1, cv2.LINE_AA)
+
+
+def draw_grid(img: np.ndarray, n: int) -> np.ndarray:
+    """Render ``img`` into a grid with spreadsheet-style axis labels.
+
+    Row numbers live in a left margin and column numbers in a top margin. Nothing is drawn
+    inside any cell except faint grid boundaries, so the model sees clean target/canvas
+    color when judging whether a cell is correct.
+    """
     if n < 1:
         raise ValueError("n must be >= 1")
-    out = img.copy()
-    h, w = out.shape[:2]
-    row_edges = np.linspace(0, h, n + 1).astype(int)
-    col_edges = np.linspace(0, w, n + 1).astype(int)
+    h, w = img.shape[:2]
+    top = _axis_margin(h)
+    left = _axis_margin(w)
+    grid_h = h - top
+    grid_w = w - left
+    if grid_h < 1 or grid_w < 1:
+        raise ValueError("image is too small for axis-labeled grid")
+
+    out = np.full_like(img, 255)
+    content = cv2.resize(img, (grid_w, grid_h), interpolation=cv2.INTER_AREA)
+    out[top:h, left:w] = content
+
+    row_edges = top + np.linspace(0, grid_h, n + 1).astype(int)
+    col_edges = left + np.linspace(0, grid_w, n + 1).astype(int)
     for y in row_edges:
-        cv2.line(out, (0, int(y)), (w, int(y)), (128, 128, 128), 1)
+        cv2.line(out, (left, int(y)), (w, int(y)), (128, 128, 128), 1)
     for x in col_edges:
-        cv2.line(out, (int(x), 0), (int(x), h), (128, 128, 128), 1)
+        cv2.line(out, (int(x), top), (int(x), h), (128, 128, 128), 1)
+
     font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.35, min(0.7, min(h, w) / 280.0))
+    label_color = (0, 0, 0)
     for i in range(n):
-        for j in range(n):
-            cy = int((row_edges[i] + row_edges[i + 1]) // 2)
-            cx = int((col_edges[j] + col_edges[j + 1]) // 2)
-            label = f"{i},{j}"
-            cv2.putText(out, label, (cx - 12, cy + 4), font, 0.35, (0, 0, 0), 2, cv2.LINE_AA)
-            cv2.putText(out, label, (cx - 12, cy + 4), font, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+        cy = int((row_edges[i] + row_edges[i + 1]) // 2)
+        _put_centered_text(out, str(i), (left // 2, cy), font, font_scale, label_color)
+    for j in range(n):
+        cx = int((col_edges[j] + col_edges[j + 1]) // 2)
+        _put_centered_text(out, str(j), (cx, top // 2), font, font_scale, label_color)
     return out
 
 
 def prepare_image(img: np.ndarray, n: int, size: int = DEFAULT_PROBE_SIZE) -> np.ndarray:
     """Downsample ``img`` to ``size x size`` and label it with the ``n x n`` grid — the
-    exact preprocessing the probe validated. Downsample first, then label, so the labels
-    are drawn at final resolution and stay crisp instead of being resampled to mush."""
+    exact preprocessing the probe validates. Labels are drawn after resizing, in top/left
+    margins outside the grid, so cell interiors remain uncontaminated."""
     if size < 1:
         raise ValueError("size must be >= 1")
     small = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
@@ -181,9 +215,12 @@ def build_prompt(n: int) -> str:
     return (
         f"You are looking at two images of the same {n}x{n} grid overlaid on a square "
         f"canvas. Image 1 is the TARGET (what the canvas should look like). Image 2 is "
-        f"the CURRENT CANVAS (what it looks like now). Grid cells are labeled 'i,j' at "
-        f"their centers: i is the row (0 at top), j is the column (0 at left). Both "
-        f"images use the same grid.\n\n"
+        f"the CURRENT CANVAS (what it looks like now). Rows are numbered along the left "
+        f"margin from top to bottom, 0-indexed. Columns are numbered along the top "
+        f"margin from left to right, 0-indexed. Identify a cell by reading its row "
+        f"number from the left margin and its column number from the top margin. Cell "
+        f"interiors contain only paint; there are no labels inside cells. Both images "
+        f"use the same grid.\n\n"
         f"If the current canvas already matches the target, call {DONE_TOOL_NAME}. Do "
         f"not keep searching a matching canvas for tiny or imagined differences.\n\n"
         f"If there is a clear mismatch, pick exactly ONE cell where the current canvas "
@@ -237,6 +274,7 @@ def build_request(
     return {
         "model": model,
         "max_tokens": max_tokens,
+        "temperature": 0,
         "messages": build_messages(target_uri, canvas_uri, n),
         "tools": [PAINT_TOOL_SCHEMA, DONE_TOOL_SCHEMA],
         "tool_choice": TOOL_CHOICE_REQUIRED if tool_choice is None else tool_choice,
